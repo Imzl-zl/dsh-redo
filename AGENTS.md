@@ -30,14 +30,19 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
 
 两条入口，同一个追加：
 
-- **重新生成**：客户端把目标写进 prompt 的 `requestId`：`redo:<targetSeq>:<uuid>`（每击一次必须换 uuid，Host 会按 rpcId 去重）；`agent/pre-step` 从认领到的消息上读回来。
-- **编辑重发**：客户端先调宿主命令 `/redo <seq>` **武装**一个目标（`ctx.commands.register`），再回填 composer；
-  用户在 composer 发的那条消息铸自己的 uuid，宿主靠 latch 认领。latch 绑定单个 agent、**只被下一条人类消息
-  （`source.kind === 'user'` 且带 rpcId）消费**、5 分钟过期即作废，`/redo off` 可撤销，显式 `redo:` id 永远优先。
-- 两者都走：`agent/pre-step` 记计划 → `agent/request` 内追加**空 content 的 `system/message`**，`replace target..surface 尾`。
-- 不要换成空 `user/message`（会发给 provider）或空 `developer/message`（时间线多一行空上下文）。
+- **撤回（编辑）＝ 立即生效**：客户端调宿主命令 `/redo <seq>`，命令**当场**按
+  `turn/start` → `step/start` → `system/message(replace target..surface 尾)` → `step/end` → `turn/end`
+  写进日志。不请求模型（没有消息进 inbox，空 turn 直接结束），日志合法（turn+step 精确匹配）。
+  点一下，上下文里就没了；客户端再把原文回填 composer，用户之后发送的是**普通消息**。
+- **重新生成**：客户端把目标写进 prompt 的 `requestId`：`redo:<targetSeq>:<uuid>`（每击一次必须换 uuid，Host 会按 rpcId 去重）；
+  `agent/pre-step` 从认领到的消息上读回来，`agent/request` 在已打开的 step 内写同样的替换。
+- 替换节点是**空 content 的 `system/message`**，节点 0 之外都能改；不要换成空 `user/message`（`deriveEventMessage`
+  对 user 直接返回 `event.data`，空内容照样发给 provider）或空 `developer/message`（时间线多一行空上下文）。
 - requestId 里的目标必须按**纯数字**解析（`/^(\d+):/`）。用 `Number()` 会把 `redo::uuid` 读成目标 `0`、
   `0x10` 读成 `16`——畸形 id 于是去改写受保护的头节点，从"无操作"变成宿主抛错。`test/redo.test.ts` 锁着这一条。
+- 为什么命令必须自己开 turn：`system/message` 只能落在已打开的 turn+step 内，点击发生在 turn 之外。
+  手写这五个事件的合法性靠顺序与坐标，`Session.append('turn/start')` 本身是公开的，loop 的 turn 号从日志投影，
+  实测重启冷读无 `SessionPersistenceCorruptionError`，随后的普通发送正常开下一个 turn。
 
 ## 编辑为什么是「消息上的点击 + 输入框里的发送」
 
@@ -47,22 +52,33 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
   `ctx.conversation.createDrafts(sessionId, files, uploadImages)` 生成——该方法在导出的
   `ConversationController` 上，**不在** `IConversation` 里，所以客户端做了一次结构性窄转换
   （`ConversationDraftsFace`），失败即禁用按钮而不是静默丢图。
-- 采用的通道：`ctx.commands`（宿主命令注册）——客户端点一下 = 调 `/redo <seq>` 武装，用户照常发送。
+- 采用的通道：`ctx.commands`（宿主命令注册）——客户端点一下 = 调 `/redo <seq>` **当场撤回**，再把内容回填 composer。
   纯公开扩展点，不需要 RPC，也不需要改 composer。
 - **排除** monkeypatch `beginSubmission`/`prompt`：提交回显 `pendingSubmissions` 是按 requestId 关联退休的，
   换掉 id 会留下永不退休的幽灵气泡。
 - **排除** 草稿里埋零宽标记：插件在 composer 序列化路径上没有挂点，标记会原样进 provider。
-- 代价（已知、可接受）：时间线会留一条 `/redo <seq>` 命令记录；latch 过期/被别的消息消费是设计内的行为。
+- 代价（已知、可接受）：撤回时时间线会多一条 `/redo <seq>` 命令记录，替换落盘后它跟着被撤回的那段一起隐藏。
 
 ## 交互
 
 - 气泡下的操作行按原生顺序：`时间`、`复制`、`重新生成`（原样重发，一键，不经过输入框）、`编辑重发`（回填输入框）。
-- `编辑重发` = **武装（`/redo <seq>`）+ 回填**：`inputActions.setDraft(文字)`，图片经 `readAttachment` 读回
-  字节 → `File` → `createDrafts` → `addAttachments`。用户在原生 composer 里改完发送即重写。
-- 中段重写先在行内确认（「之后的 N 轮对话会离开上下文」）；**输入框本来非空时再问一句是否替换**。
-  失效消息由客户端 `[target, replacement)` 区间注册表降级并禁用，不再触发宿主抛错。
-- composer 发送带不了 `redo:` 标记，所以区间靠「武装后第一条更新的用户消息就是替换者」补登（与宿主同规则）；
-  这张表只在内存里，刷新后 composer 路径的变暗丢失，`redo:` 路径的仍保留。
+- `编辑重发` = **当场撤回 + 回填**：先调 `/redo <seq>`（宿主立刻写替换，上下文里就没了），再把文字经
+  `inputActions.setDraft` 放回 composer、图片经 `readAttachment` → `File` → `createDrafts` → `addAttachments`
+  挂成草稿。用户改完发送的是**普通消息**，不再需要任何标记。
+  图片必须在调命令**之前**读回：命令一落地消息就没了，读图失败会连图一起丢。
+- 中段撤回先在行内确认（「之后的 N 轮对话会离开上下文」）；**输入框本来非空时再问一句是否替换**。
+- **被撤回的那一轮整轮从时间线撤掉**，不是变暗：消息、回答、工具卡、过程行、用量行一起消失。只变暗会让它
+  读起来像「又发了一遍」，正是插件要避免的效果。
+- 撤掉靠两层：插件自己的 `user` cell（被遮蔽就渲染空 div），加上挂载后按 `data-chat-turn` 隐藏**整个 Turn**
+  ——回答/工具卡/用量行是官方 cell 渲染的，插件碰不到它们的组件。`MutationObserver` 负责补上晚到的行
+  （撤回 turn 的用量行在 turn 关闭后才渲染）。
+- **撤回自己也要藏**：命令开的那个 turn 没有任何消息，但 flow 照样给它的 `turn-process` / `turn-tail` 两行，
+  时间线上会留一句空的「已完成」。`deriveRetractionTurns` 按「这个 turn 里有 replace、但没有 `user/message`」
+  认出来，一起隐藏。
+- 区间和撤回 turn **都不靠客户端记账**：都用会话自己的事件窗口（`binding.eventSource`）里的
+  `surfaceOp: replace` 与 turn 边界反推（`src/client/intervals.ts`）。刷新后依然撤掉，没有 localStorage。
+- 命令卡是 log-only 事件，seq 落在 replace 区间的**外面**（区间端点是 surface 节点的 seq），所以不能用
+  seq 判断，只能看它撤回的目标。
 - 生成期间重发/编辑置灰：不走 queue，避免重发出现在输入框上方的「排队消息」里。
 - 图片：存的图走 `session.readAttachment` 重新挂成草稿，不再由插件前端弹窗自己编码；文件块仍不可重发。
 - 已知缺口：`InputActions` 上没有 `focus()`（只在 `SessionInput` 上），回填后不会自动把焦点交给 composer。
@@ -96,23 +112,23 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 
 ## 已验证
 
-**自动化**：`npm test`（18 项，`test/redo.test.ts`）锁着宿主半的不变式——turn+step 精确、`sourceEventSeqs`
-全覆盖被遮蔽的 surface 尾、节点 0 拒改、计划只消费一次、非用户/失效消息报错、畸形 requestId 不重写；
-命令路线覆盖武装→下一条人类消息重写、只消费一次、工具步不消费、TTL 过期作废、`/redo off`、显式重发优先、
-非法参数/目标被拒。改 `src/index.ts` 前先跑它。变异检验两次（收窄 `endSeq` / 少一个 `sourceEventSeqs` 节点 /
-去掉 TTL 判断）都能立刻变红。
+**自动化**：`npm test`（24 项）。
+`test/redo.test.ts`（18 项）管宿主半——撤回命令写出的五个事件顺序与坐标（turn/step 精确、turn 号跟着日志走、
+不留 open step）、`sourceEventSeqs` 全覆盖被遮蔽的 surface 尾、节点 0 拒改、替换是空 system 而非 user、
+非法参数/越界目标/非人类消息全被拒且不碰日志；重试路线覆盖 plan 只消费一次、step 作用域、畸形 requestId 不重写。
+`test/intervals.test.ts`（6 项）管客户端推导——闭区间、重叠区间逐条保留、append 与畸形 marker 不算替换、
+只凭日志重建同一结果，以及「只有 replace 没有 user 的 turn」被认成撤回 turn。
+改 `src/index.ts` 前先跑它。变异检验两次（收窄 `endSeq` / 少一个 `sourceEventSeqs` 节点 / 去掉 TTL 判断）都能立刻变红。
 
-**手工（composer 路径已真机验证）**：packaged 0.2.1-rc.2 GUI + `redo-test` profile + 本地 Cherry 网关，
-2026-10-24 20:1x 实测三条路径：
+**手工（packaged 0.2.1-rc.2 GUI + `redo-test` profile + 本地 Cherry 网关）**：
 
-| 路径 | GUI 表现 | JSONL 证据 |
-| --- | --- | --- |
-| 编辑重发（文字） | 确认行「内容会放回输入框；发送后，之后的 1 轮对话会离开上下文」→ composer 出现原文 → 改后发送 → 旧两条变暗标「已被替换」、新条标「已重发」 | `system/message replace 8..26 src=[8,12,18,25,26] content=0` 紧跟 `user/message append` |
-| 编辑重发（图片） | 粘贴红图发送 → 模型答「红色」；点编辑重发 → composer 同时回填文字 + 图片草稿；改文字再发 → 变暗/已重发正确，模型答「红」 | `replace 57..59 src=[57,59] content=0` + 新 `user/message` 带 `<image>` |
-| 重新生成 | 一键重发，不经输入框 | `replace 69..71` + 新 `user/message` `rpc=redo:69:…` |
+| 时间 | 路径 | GUI 表现 | JSONL 证据 |
+| --- | --- | --- | --- |
+| 20:1x | 编辑重发（文字） | composer 出现原文 → 改后发送 → 旧轮撤掉 | `replace 8..26 src=[8,12,18,25,26]` + 新 `user/message` |
+| 20:1x | 编辑重发（图片） | 粘贴红图 → 答「红色」；回填文字+图片草稿 → 改字再发 → 答「红」 | `replace 57..59` + 新 `user/message` 带 `<image>` |
+| 20:1x | 重新生成 | 一键重发，不经输入框 | `replace 69..71` + `rpc=redo:69:…` |
+| 22:0x | 重试最后一条 / 编辑 / 中段重试 | 被重写的那一轮（消息、回答、过程行、用量行）整轮撤掉，新一轮落在原位 | `replace 8..18` / `26..29` / `39..52` |
+| 22:5x | **点击即撤回** | 点「编辑重发」后 1.8 秒内时间线只剩 0 行（含插件开的空 turn 与命令卡），composer 拿到原文 | `turn/start 2` → `step/start` → `replace 8..18` → `step/end` → `turn/end` |
+| 22:5x | 撤回后冷读 | 重启实例打开该会话正常，**无 `SessionPersistenceCorruptionError`**；接着发消息正常开 turn 3 | 同上 |
 
 上下文确实被重写：重写后追问「你现在能看到的用户消息一共几条」，模型答 **2**（不是 4），并确认看不到被丢弃的那条。
-时间线出现一张 `redo 已完成` 命令卡（预期内）。重启实例后冷读该会话正常，**无 `SessionPersistenceCorruptionError`**，
-4 轮全部渲染——同时也确认了文档里那条限制：刷新后 composer 路径的变暗标记消失（`redo:` 路径的保留）。
-
-`/redo off` 只在单测里覆盖，GUI 里没有入口（没有取消按钮），符合当前设计。

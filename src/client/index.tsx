@@ -17,17 +17,16 @@
  * hover-reveal behaviour the shipped row uses for older Turns.
  *
  * The log is append-only, so a rewind shadows an interval instead of deleting
- * it. This half therefore keeps a small registry of `[target, replacement)`
- * intervals, dims the messages inside them, and refuses a second rewind there
- * instead of letting the Host throw into the transcript.
+ * it. A shadowed message is not in the conversation any more, so its row renders
+ * nothing at all — the replacement message takes the same place on screen the
+ * old one had. Dimming it instead made a rewind look exactly like sending the
+ * same text again by hand, which is the one thing these actions exist to avoid.
  *
- * A composer rewrite cannot mint its own request id — the composer owns it — so
- * the durable `redo:` marker only exists on the retry path. For the composer
- * path this half registers the interval as soon as the replacement message
- * appears (`ARMED` below): the Host applies the armed rewrite to the very next
- * message, which is exactly the rule used here. The interval registry is memory
- * only, so dimmed history and the 「已重发」 badge survive a reload only for
- * retry-shaped rewinds.
+ * Which intervals are shadowed is read back from the Session's own event window
+ * (`deriveIntervals`): every rewind is a `surfaceOp: replace` append, so the log
+ * already answers it, and a reload keeps the message hidden. Both entry points
+ * cover the same ground — the immediate retraction and the retry — because
+ * neither needs to remember anything client-side.
  *
  * Images ride the composer as drafts: stored bytes are read back through
  * `readAttachment`, wrapped as a `File`, and staged with `createDrafts`. Files
@@ -39,11 +38,13 @@
  * @module dsh-redo/client
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import {
+  useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
+} from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { SessionFace } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionEventSource, SessionFace } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { InjectFace, PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
   ChatNodeViewProps, UserContentAttachment, UserContentData, UserMessageNode,
@@ -54,6 +55,10 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: pulls `ctx.conversation`, `ctx.uiConversation`, and the `chat` target merge.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import {
+  covers, deriveIntervals, deriveRetractionTurns,
+  type SupersededInterval, type SurfaceEventLike,
+} from './intervals.ts'
 import { en, zh, type RedoKey } from './locales.ts'
 
 export const inject = ['slots', 'sessions', 'conversation', 'uiConversation', 'locale']
@@ -103,7 +108,7 @@ type ArmResult =
 
 /** Business face injected into the user-message row. */
 export interface RedoInjected {
-  /** Session this row belongs to, used to scope the superseded registry. */
+  /** Session this row belongs to, used to scope the superseded table. */
   readonly sessionId: SessionId
   /** Active locale id, used for the message clock. */
   readonly localeId: string
@@ -139,85 +144,62 @@ export interface RedoInjected {
   subscribeRunning: (listener: () => void) => () => void
   /** @returns whether this Session is generating right now. */
   isRunning: () => boolean
-}
-
-/** One shadowed interval: the redo target and the seq of its replacement. */
-interface SupersededRange {
-  readonly from: number
-  readonly to: number
-}
-
-/**
- * Interval registry shared by every mounted row. A row that carries a redo
- * request id registers the interval it replaced, so an older row can dim and
- * stop offering an action the Host would reject.
- */
-const RANGES = new Map<string, SupersededRange[]>()
-const RANGE_LISTENERS = new Set<() => void>()
-let rangeRevision = 0
-
-/**
- * One armed composer rewrite whose replacement seq is not known yet. The Host
- * applies an armed target to the next message the Session sends; this record
- * lets the resulting row register the same interval the retry path learns from
- * its request id.
- */
-const ARMED = new Map<string, { readonly target: number; readonly at: number }>()
-
-/** How long an armed record is still assumed to explain the next message. */
-const ARM_WINDOW_MS = 10 * 60 * 1000
-
-/**
- * Record one replacement interval.
- * @param sessionId - owning Session.
- * @param from - seq of the replaced message.
- * @param to - seq of the replacement message (exclusive upper bound).
- */
-function registerReplacement(sessionId: string, from: number, to: number): void {
-  const current = RANGES.get(sessionId) ?? []
-  if (current.some(range => range.from === from && range.to === to)) return
-  RANGES.set(sessionId, [...current, { from, to }])
-  rangeRevision += 1
-  for (const listener of RANGE_LISTENERS) listener()
+  /**
+   * Observe this Session's shadowed intervals, read from its event window. A row
+   * subscribes so a retraction lands on screen without a reload.
+   */
+  subscribeSuperseded: (listener: () => void) => () => void
+  /** @returns the interval revision, the `useSyncExternalStore` snapshot. */
+  supersededRevision: () => number
+  /**
+   * @param seq - message seq to test.
+   * @returns whether the message was removed from the conversation by a rewind.
+   */
+  isHidden: (seq: number) => boolean
+  /**
+   * DOM node keys of shadowed rows the Chat flow renders outside any Turn — a
+   * slash-command card carries no `data-chat-turn`, so hiding the Turn is not
+   * enough to take the `redo` that caused this retraction off the screen.
+   * @returns the `data-chat-node-key` suffixes to hide.
+   */
+  shadowedCommandKeys: () => readonly string[]
+  /**
+   * @returns the Turns that hold nothing but a retraction, whose process rows
+   *   have to leave the screen along with the replaced message.
+   */
+  retractionTurns: () => readonly number[]
 }
 
 /**
- * Whether a seq sits inside a shadowed interval.
+ * Shadowed intervals per Session, each Session's table read off its own event
+ * window (see {@link deriveIntervals}). A row uses it to decide it is gone.
+ */
+const RANGES = new Map<string, readonly SupersededInterval[]>()
+
+/**
+ * Turns that exist only to carry a retraction (see `deriveRetractionTurns`): the
+ * Chat flow renders their process rows even though no message ever landed, so
+ * they have to leave the screen with the message they removed.
+ */
+const RETRACTIONS = new Map<string, readonly number[]>()
+
+/** One Session's hidden-set feed, identity-stable so every row shares it. */
+interface RangeFeed {
+  /** Subscribe to hidden-set changes. */
+  readonly subscribe: (listener: () => void) => () => void
+  /** @returns the feed revision, a safe `useSyncExternalStore` snapshot. */
+  readonly revision: () => number
+}
+
+/**
+ * Whether a seq was removed from the conversation by a rewind.
  * @param sessionId - owning Session.
  * @param seq - message seq to test.
  * @returns true when the message is no longer part of the active context.
  */
 function isSupersededSeq(sessionId: string, seq: number): boolean {
-  const ranges = RANGES.get(sessionId)
-  if (ranges === undefined) return false
-  return ranges.some(range => seq >= range.from && seq < range.to)
-}
-
-/**
- * The seq one replacement swallowed.
- * @param sessionId - owning Session.
- * @param seq - candidate replacement seq.
- * @returns the replaced seq, or undefined when this message is not a replacement.
- */
-function replacedBySeq(sessionId: string, seq: number): number | undefined {
-  const ranges = RANGES.get(sessionId)
-  if (ranges === undefined) return undefined
-  return ranges.find(range => range.to === seq)?.from
-}
-
-/**
- * Subscribe to interval changes.
- * @param listener - change callback.
- * @returns the unsubscribe function.
- */
-function subscribeRanges(listener: () => void): () => void {
-  RANGE_LISTENERS.add(listener)
-  return () => { RANGE_LISTENERS.delete(listener) }
-}
-
-/** @returns the registry revision, a safe `useSyncExternalStore` snapshot. */
-function rangesRevision(): number {
-  return rangeRevision
+  const intervals = RANGES.get(sessionId)
+  return intervals !== undefined && covers(intervals, seq)
 }
 
 /** Split durable content blocks into the Factory's prepared shape. */
@@ -350,24 +332,6 @@ function clockLabel(time: number, localeId: string): string {
   }
 }
 
-/** Durable source facts this row reads (producer-owned, so read defensively). */
-interface RedoMessageSource {
-  readonly rpcId?: unknown
-}
-
-/** Request-id grammar the Host half mints for a retry: `redo:<seq>:<uuid>`. */
-const REDO_RPC_ID = /^redo:(\d+):/u
-
-/** Whether this durable message was itself produced by a retry. */
-function replacedFrom(source: unknown): number | undefined {
-  if (typeof source !== 'object' || source === null) return undefined
-  const { rpcId } = source as RedoMessageSource
-  if (typeof rpcId !== 'string') return undefined
-  const match = REDO_RPC_ID.exec(rpcId)
-  if (match === null) return undefined
-  return Number(match[1])
-}
-
 /** Prefer the platform UUID generator; fall back when the page is not a secure context. */
 function uuid(): string {
   const generator = globalThis.crypto as { randomUUID?: () => string } | undefined
@@ -414,7 +378,8 @@ function CheckIcon() {
  */
 function RedoUserMessage({
   node, renderFactorySlot, loadImage, t, resend, arm, laterTurns, subscribeRunning, isRunning,
-  sessionId, localeId, inputActions, useInput,
+  sessionId, localeId, inputActions, useInput, subscribeSuperseded, supersededRevision, isHidden,
+  shadowedCommandKeys, retractionTurns,
 }: RedoUserMessageProps) {
   const data = node.data as UserMessageNode & {
     readonly referenceLabels?: readonly string[]
@@ -432,33 +397,57 @@ function RedoUserMessage({
     ...data.skillNames === undefined ? {} : { skillNames: data.skillNames },
   }), [data.referenceLabels, data.skillNames])
 
-  const scope = String(sessionId)
-  const replacementTarget = replacedFrom(data.source)
-  // Re-render when any row reports a replacement, so a message that just left
-  // the context dims without waiting for its own data to change.
-  useSyncExternalStore(subscribeRanges, rangesRevision)
-  const superseded = isSupersededSeq(scope, data.seq)
+  // Re-render when this Session's hidden set changes — a retraction landing, or
+  // a retry replacing a message — so a removed row stops rendering without
+  // waiting for its own data to change.
+  useSyncExternalStore(subscribeSuperseded, supersededRevision)
+  const hidden = isHidden(data.seq)
   // Only the fields that matter here: the published input state carries much
   // more, and depending on the whole shape would break on an upstream addition.
   const composerOccupied = useInput((state: { readonly draft: string; readonly attachmentIds: readonly unknown[] }) =>
     state.draft.trim() !== '' || state.attachmentIds.length > 0)
 
-  useEffect(() => {
-    if (replacementTarget === undefined) return
-    registerReplacement(scope, replacementTarget, data.seq)
-  }, [replacementTarget, scope, data.seq])
-
-  // A composer rewrite leaves no request id behind: the composer mints its own.
-  // The Host applies an armed target to the Session's next message, so the first
-  // row newer than the target after arming IS the replacement.
-  useEffect(() => {
-    const record = ARMED.get(scope)
-    if (record === undefined) return
-    if (data.seq <= record.target) return
-    ARMED.delete(scope)
-    if (Date.now() - record.at > ARM_WINDOW_MS) return
-    registerReplacement(scope, record.target, data.seq)
-  }, [scope, data.seq])
+  const rowRef = useRef<HTMLDivElement | null>(null)
+  // A rewind removes the whole Turn, not this one row: the answer, the tool
+  // cards, the process row and the usage tail all belong to it and are rendered
+  // by the shipped cells, which know nothing about redo. Hiding only our own
+  // bubble leaves an orphaned answer, so the effect hides the Turn container the
+  // Chat flow rendered around this message, scoped to that same flow so two
+  // Sessions on screen cannot share a Turn number.
+  useLayoutEffect(() => {
+    if (!hidden) return undefined
+    const flow = rowRef.current?.closest('[data-slot="conversation.chat.flow"]') ?? null
+    if (flow === null) return undefined
+    const marked = new Set<Element>()
+    const apply = () => {
+      const turn = rowRef.current?.closest('[data-chat-turn]')?.getAttribute('data-chat-turn') ?? null
+      if (turn === null || !/^\d+$/u.test(turn)) return
+      const items = [...flow.querySelectorAll(`[data-chat-turn="${turn}"]`)]
+      // The Turn opened only to carry the replacement has no message of its own,
+      // but the flow still renders its process and usage rows.
+      for (const carried of retractionTurns()) {
+        items.push(...flow.querySelectorAll(`[data-chat-turn="${String(carried)}"]`))
+      }
+      // The command card that caused this retraction sits outside every Turn.
+      for (const key of shadowedCommandKeys()) {
+        items.push(...flow.querySelectorAll(`[data-chat-node-key$="${key}"]`))
+      }
+      for (const item of items) {
+        item.setAttribute('data-dsh-redo-hidden', '')
+        marked.add(item)
+      }
+    }
+    apply()
+    // Rows of the retraction Turn land after the first pass — the usage tail is
+    // appended once the turn closes — and the flow may rebuild rows later, so a
+    // one-shot pass would leave an empty 「已完成」 line behind.
+    const observer = new MutationObserver(apply)
+    observer.observe(flow, { childList: true, subtree: true })
+    return () => {
+      observer.disconnect()
+      for (const item of marked) item.removeAttribute('data-dsh-redo-hidden')
+    }
+  }, [hidden, retractionTurns, shadowedCommandKeys])
 
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<string | undefined>(undefined)
@@ -473,8 +462,8 @@ function RedoUserMessage({
   const editable = !layout.blockedByFile && !layout.blockedByOther
   const retryable = editable && (layout.text.trim() !== '' || layout.images.length > 0)
   const running = useSyncExternalStore(subscribeRunning, isRunning)
-  const canRetry = retryable && !superseded && !running
-  const canEdit = editable && !superseded && !running
+  const canRetry = retryable && !running
+  const canEdit = editable && !running
 
   useEffect(() => () => {
     if (copyTimer.current !== null) window.clearTimeout(copyTimer.current)
@@ -518,7 +507,6 @@ function RedoUserMessage({
       inputActions.setDraft(layout.text)
       if (staged.draftIds.length > 0 && !inputActions.addAttachments(staged.draftIds)) {
         setFailure(t('error.attachment'))
-        return
       }
     } catch (thrown) {
       setFailure(thrown instanceof Error ? thrown.message : String(thrown))
@@ -571,31 +559,29 @@ function RedoUserMessage({
       ? t('confirm.editUnknown')
       : dropCount === 0 ? t('confirm.edit') : t('confirm.editText', { count: dropCount })
 
-  const retryTitle = superseded
-    ? t('action.superseded')
-    : running
-      ? t('action.running')
-      : retryable ? t('action.retryHint') : t('action.unsupported')
-  const editTitle = superseded
-    ? t('action.superseded')
-    : running
-      ? t('action.running')
-      : editable ? t('action.editHint') : t('action.unsupported')
+  const retryTitle = running
+    ? t('action.running')
+    : retryable ? t('action.retryHint') : t('action.unsupported')
+  const editTitle = running
+    ? t('action.running')
+    : editable ? t('action.editHint') : t('action.unsupported')
   const copyTitle = parts.text === ''
     ? t('action.copyEmpty')
     : copied ? t('action.copied') : t('action.copy')
 
+  // A removed message is not in the conversation any more, so nothing of it is
+  // rendered: the empty div is only the anchor the effect above needs to find
+  // the Turn it has to hide. Keeping the bubble (even dimmed) made a rewind read
+  // as an ordinary second send, which is the one thing these actions exist to
+  // avoid.
+  if (hidden) return <div ref={rowRef} />
+
   return (
-    <div className="dsh-redo-row" data-superseded={superseded ? '' : undefined}>
-      <div className="dsh-redo-content" data-superseded={superseded ? '' : undefined}>
+    <div className="dsh-redo-row" ref={rowRef}>
+      <div className="dsh-redo-content">
         {renderFactorySlot('conversation.chat.user.content', { content, loadImage, facts, interactive: true })}
       </div>
       <div className="dsh-redo-meta">
-        {superseded
-          ? <span className="dsh-redo-flag" title={t('badge.supersededHint')}>{t('badge.superseded')}</span>
-          : replacementTarget === undefined && replacedBySeq(scope, data.seq) === undefined
-            ? null
-            : <span className="dsh-redo-flag" title={t('badge.replacedHint')}>{t('badge.replaced')}</span>}
         {typeof data.time === 'number'
           ? <span className="dsh-redo-time">{clockLabel(data.time, localeId)}</span>
           : null}
@@ -692,17 +678,12 @@ function RedoUserMessage({
 
 /** Plugin-owned stylesheet: the replaced row owns its own layout. */
 const CSS = `
+[data-dsh-redo-hidden] { display: none !important; }
 .dsh-redo-row { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 0; }
 .dsh-redo-content { display: flex; flex-direction: column; align-items: flex-end; width: 100%; min-width: 0; }
-.dsh-redo-content[data-superseded] { opacity: .5; transition: opacity .16s ease; }
 .dsh-redo-meta {
   display: flex; align-items: center; gap: 8px;
   height: calc(28px + var(--dsh-content-font-delta, 0px));
-}
-.dsh-redo-flag {
-  font-size: var(--dsh-content-font-size-secondary, 13px);
-  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
-  color: var(--dsw-alias-label-tertiary); white-space: nowrap;
 }
 .dsh-redo-time {
   font-size: var(--dsh-content-font-size-secondary, 13px);
@@ -733,11 +714,11 @@ const CSS = `
 .dsh-redo-confirm-text { min-width: 0; }
 .dsh-redo-confirm-note { display: block; color: var(--dsw-alias-label-tertiary); }
 @media (hover: hover) {
-  [data-chat-flow-kind=user]:has(~ [data-chat-flow-kind=user]) .dsh-redo-row:not([data-superseded]) .dsh-redo-meta {
+  [data-chat-flow-kind=user]:has(~ [data-chat-flow-kind=user]) .dsh-redo-row .dsh-redo-meta {
     opacity: 0; transition: opacity 80ms;
   }
-  [data-chat-flow-kind=user]:has(~ [data-chat-flow-kind=user]):hover .dsh-redo-row:not([data-superseded]) .dsh-redo-meta,
-  [data-chat-flow-kind=user]:has(~ [data-chat-flow-kind=user]):focus-within .dsh-redo-row:not([data-superseded]) .dsh-redo-meta {
+  [data-chat-flow-kind=user]:has(~ [data-chat-flow-kind=user]):hover .dsh-redo-row .dsh-redo-meta,
+  [data-chat-flow-kind=user]:has(~ [data-chat-flow-kind=user]):focus-within .dsh-redo-row .dsh-redo-meta {
     opacity: 1;
   }
 }
@@ -768,7 +749,11 @@ const CSS = `
  * the Session controller's client service, whose `binding()` this face names.
  */
 interface ClientSessionsFace {
-  binding(id: SessionId): { readonly session: SessionFace } | undefined
+  binding(id: SessionId): {
+    readonly session: SessionFace
+    /** Loaded event window: where a rewind's shadowed interval is durable. */
+    readonly eventSource: SessionEventSource
+  } | undefined
 }
 
 /**
@@ -804,6 +789,8 @@ function conversationDrafts(ctx: Context): ConversationDraftsFace {
   return ctx.conversation as unknown as ConversationDraftsFace
 }
 
+
+
 /**
  * Install the user-message redo actions.
  * @param ctx - client root context.
@@ -838,6 +825,108 @@ export function apply(ctx: Context): void {
     return source
   }
 
+  // Interval feeds read each Session's own event window, so a retraction stays
+  // hidden across reloads instead of coming back with the message it removed.
+  const rangeFeeds = new Map<string, RangeFeed>()
+  const rangeStops: (() => void)[] = []
+  const rangeFeed = (id: string): RangeFeed => {
+    const existing = rangeFeeds.get(id)
+    if (existing !== undefined) return existing
+    let revision = 0
+    const listeners = new Set<() => void>()
+    const publish = (intervals: readonly SupersededInterval[], turns: readonly number[]) => {
+      const previous = RANGES.get(id)
+      const previousTurns = RETRACTIONS.get(id)
+      // Every accepted event republishes the window; a bulletin per event would
+      // re-render every row for nothing, so only a changed table notifies.
+      const sameRanges = previous !== undefined
+        && previous.length === intervals.length
+        && previous.every((interval, index) => (
+          interval.from === intervals[index]?.from && interval.to === intervals[index]?.to
+        ))
+      const sameTurns = previousTurns !== undefined
+        && previousTurns.length === turns.length
+        && previousTurns.every((turn, index) => turn === turns[index])
+      RANGES.set(id, intervals)
+      RETRACTIONS.set(id, turns)
+      if (sameRanges && sameTurns) return
+      revision += 1
+      for (const listener of listeners) listener()
+    }
+    let unsubscribe: (() => void) | undefined
+    const read = () => {
+      const binding = clientSessions(ctx).binding(id as SessionId)
+      if (binding === undefined) return
+      const events: SurfaceEventLike[] = []
+      for (const entry of binding.eventSource.getSnapshot().entries) {
+        if (entry.type === 'event') events.push(entry.event)
+      }
+      publish(deriveIntervals(events), deriveRetractionTurns(events))
+      if (unsubscribe === undefined) {
+        const stop = binding.eventSource.subscribe(read)
+        unsubscribe = stop
+        rangeStops.push(stop)
+      }
+    }
+    const feed: RangeFeed = {
+      subscribe: (listener) => {
+        // A cell can mount before its Session binding exists; every new
+        // subscription retries the bind instead of freezing an empty table.
+        read()
+        listeners.add(listener)
+        return () => { listeners.delete(listener) }
+      },
+      revision: () => revision,
+    }
+    rangeFeeds.set(id, feed)
+    return feed
+  }
+  ctx.effect(() => () => {
+    for (const stop of rangeStops) stop()
+  }, 'dsh-redo: interval feeds')
+
+  // Identity-stable per Session: the row effect depends on this reader, and a
+  // fresh closure each render would re-hide the same rows on every refresh.
+  const commandKeyReaders = new Map<string, () => readonly string[]>()
+  const shadowedCommandKeys = (id: string): (() => readonly string[]) => {
+    const existing = commandKeyReaders.get(id)
+    if (existing !== undefined) return existing
+    const read = (): readonly string[] => {
+      const snapshot = ctx.uiConversation.binding(id as SessionId).target('chat').getSnapshot()
+      if (snapshot === undefined) return []
+      const keys: string[] = []
+      for (const value of snapshot.nodes.values()) {
+        if (value.kind !== 'command') continue
+        // Chat nodes carry their facts under `data`, one level below the union
+        // discriminant the row key is built from.
+        const data = value.data as { name?: unknown; args?: unknown; commandId?: unknown } | null
+        if (typeof data?.commandId !== 'string' || data.name !== 'redo') continue
+        // A command is a log-only event, so it sits outside the replaced surface
+        // interval — its own seq proves nothing. What ties the card to a rewind
+        // is the target it retracted, and that target is shadowed by the replace it wrote.
+        // consumed it was rewritten.
+        const target = Number(String(data.args ?? '').trim())
+        if (!Number.isSafeInteger(target) || !isSupersededSeq(id, target)) continue
+        keys.push(`command${data.commandId}`)
+      }
+      return keys
+    }
+    commandKeyReaders.set(id, read)
+    return read
+  }
+
+  // Identity-stable for the same reason as the command-key reader: the row
+  // effect depends on it, and a fresh closure each render would re-hide the same
+  // rows on every refresh.
+  const retractionReaders = new Map<string, () => readonly number[]>()
+  const retractionTurns = (id: string): (() => readonly number[]) => {
+    const existing = retractionReaders.get(id)
+    if (existing !== undefined) return existing
+    const read = (): readonly number[] => RETRACTIONS.get(id) ?? []
+    retractionReaders.set(id, read)
+    return read
+  }
+
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
     name: 'conversation.chat.node',
     key: 'user',
@@ -851,6 +940,11 @@ export function apply(ctx: Context): void {
       localeId: ctx.locale.getLocale().active,
       subscribeRunning: runningSource(sessionId).subscribe,
       isRunning: runningSource(sessionId).isRunning,
+      subscribeSuperseded: rangeFeed(sessionId).subscribe,
+      supersededRevision: rangeFeed(sessionId).revision,
+      isHidden: (seq) => isSupersededSeq(sessionId, seq),
+      shadowedCommandKeys: shadowedCommandKeys(sessionId),
+      retractionTurns: retractionTurns(sessionId),
       laterTurns: (target) => {
         const binding = clientSessions(ctx).binding(sessionId as SessionId)
         if (binding === undefined) return undefined
@@ -874,21 +968,16 @@ export function apply(ctx: Context): void {
         if (binding === undefined) return { ok: false, code: 'not-open' }
         const session = binding.session
         // The row disables redo while generating; this guard covers a race with
-        // another client. An armed rewrite would land in the composer queue.
+        // another client. A retraction mid-turn would rewrite the turn in flight.
         if (session.getSnapshot().running) return { ok: false, code: 'running' }
-        const armed = await session.command(`/redo ${String(target)}`)
-        if (!armed.ok) return { ok: false, code: 'rejected', message: armed.error.message }
-        if (!armed.value.matched) return { ok: false, code: 'command' }
         // Stored images are read back as bytes and staged as ordinary composer
-        // drafts, so the send path stays the one the user knows. A failed read
-        // disarms again instead of leaving a rewrite that would drop images.
+        // drafts, so the send path stays the one the user knows. This happens
+        // *before* the retraction: once the command lands the message is gone,
+        // and a failed read would have taken its images with it.
         const files: File[] = []
         for (const [index, image] of images.entries()) {
           const stored = await session.readAttachment(image.attachmentId)
-          if (!stored.ok) {
-            await session.command('/redo off')
-            return { ok: false, code: 'attachment' }
-          }
+          if (!stored.ok) return { ok: false, code: 'attachment' }
           files.push(new File(
             [stored.value.data],
             image.name ?? `redo-${String(target)}-${String(index)}.${extensionOf(image.mediaType)}`,
@@ -898,7 +987,11 @@ export function apply(ctx: Context): void {
         const drafts = files.length === 0
           ? []
           : conversationDrafts(ctx).createDrafts(sessionId as SessionId, files, true)
-        ARMED.set(sessionId, { target, at: Date.now() })
+        // The retraction is the click: the Host rewinds the context right here,
+        // inside a Turn it opens and closes for exactly this append.
+        const retracted = await session.command(`/redo ${String(target)}`)
+        if (!retracted.ok) return { ok: false, code: 'rejected', message: retracted.error.message }
+        if (!retracted.value.matched) return { ok: false, code: 'command' }
         return { ok: true, draftIds: drafts.map(draft => draft.id) }
       },
       resend: async (target, parts) => {

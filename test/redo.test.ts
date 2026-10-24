@@ -1,16 +1,21 @@
 /**
  * Regression net for the host half.
  *
- * A rewind is a single `system/message` append that must simultaneously: land
- * in the open turn+step (a mismatch corrupts the JSONL on the next cold read),
- * shadow the whole surface tail from the target on, and cover exactly that tail
- * in `sourceEventSeqs`. Each test states one of those invariants and checks it
- * against a fake session, so a refactor that quietly widens, narrows, or
- * re-scopes the append goes red without a browser.
+ * Two entry points, two different obligations:
  *
+ * - `/redo <seq>` **retracts now**. The click happens between Turns, so the
+ *   command opens a Turn, writes the replacement inside its only Step, and closes
+ *   both. A `system/message` appended outside an open turn+step makes the next
+ *   JSONL read reject the log, so the coordinates are as load-bearing here as in
+ *   the retry path.
+ * - A `redo:<seq>:<uuid>` prompt **retries**, and the replacement must land in
+ *   the step that claimed it — `agent/pre-step` records the plan, `agent/request`
+ *   consumes it exactly once.
+ *
+ * Each test states one of those invariants against a fake session, so a refactor
+ * that quietly widens, narrows, or re-scopes an append goes red without a browser.
  * The hooks are exercised through `apply(ctx)` — the same path the host uses —
- * rather than through an exported helper, so the wiring, the `/redo` command,
- * and the composer latch are covered too.
+ * rather than through an exported helper.
  */
 
 import assert from 'node:assert/strict'
@@ -30,23 +35,29 @@ interface FakeMessage {
   readonly source: FakeSource
 }
 
-/** The one append shape the host half is allowed to make. */
-interface RewindAppend {
+/** One recorded append, whatever the event type. */
+interface RecordedAppend {
   readonly type: string
   readonly data: {
-    readonly turn: number
-    readonly step: number
-    readonly message: {
+    readonly turn?: number
+    readonly step?: number
+    readonly message?: {
       readonly id: string
       readonly role: string
       readonly content: readonly unknown[]
       readonly source: { readonly kind: string }
     }
   }
-  readonly options: {
+  readonly options?: {
     readonly surfaceOp: { readonly op: string; readonly startSeq: number; readonly endSeq: number }
     readonly sourceEventSeqs: readonly number[]
   }
+}
+
+/** One already-committed event the log holds before the plugin runs. */
+interface LoggedEvent {
+  readonly type: string
+  readonly data: unknown
 }
 
 type Handler = (payload: unknown, next: () => Promise<void>) => unknown
@@ -57,12 +68,14 @@ interface FakeCommand {
   readonly handler: (invocation: unknown) => unknown
 }
 
-/** Minimal stand-in for the agent's session surface. */
+/** Minimal stand-in for the agent's session surface and log. */
 interface FakeSession {
   readonly surface: { readonly nodes: readonly number[] }
-  readonly appends: RewindAppend[]
+  readonly appends: RecordedAppend[]
+  readonly log: readonly LoggedEvent[]
   eventAt(seq: number): unknown
-  append(type: string, data: unknown, options: unknown): void
+  snapshotEvents(): readonly LoggedEvent[]
+  append(type: string, data: unknown, options?: unknown): void
 }
 
 interface FakeAgent {
@@ -84,14 +97,20 @@ interface FakeCtx {
 }
 
 /** Build a session whose surface is `nodes`, appends recorded in order. */
-function fakeSession(nodes: readonly number[], events: ReadonlyMap<number, unknown>): FakeSession {
-  const appends: RewindAppend[] = []
+function fakeSession(
+  nodes: readonly number[],
+  events: ReadonlyMap<number, unknown>,
+  log: readonly LoggedEvent[],
+): FakeSession {
+  const appends: RecordedAppend[] = []
   return {
     surface: { nodes },
     appends,
+    log,
     eventAt(seq) { return events.get(seq) },
+    snapshotEvents() { return log },
     append(type, data, options) {
-      appends.push({ type, data, options } as RewindAppend)
+      appends.push({ type, data, options } as RecordedAppend)
     },
   }
 }
@@ -119,9 +138,13 @@ function fakeCtx(): FakeCtx {
 }
 
 /** Install the plugin on a fresh context and agent. */
-function harness(nodes: readonly number[], events: ReadonlyMap<number, unknown>) {
+function harness(
+  nodes: readonly number[],
+  events: ReadonlyMap<number, unknown>,
+  log: readonly LoggedEvent[] = [],
+) {
   const ctx = fakeCtx()
-  const session = fakeSession(nodes, events)
+  const session = fakeSession(nodes, events, log)
   const agent: FakeAgent = { session }
   // The plugin registers hooks, effects, and one command, and only reads
   // `session` off the agent, so this cast is the whole test seam.
@@ -155,19 +178,120 @@ const HUMAN_PROMPT: FakeMessage = {
   source: { kind: 'user', rpcId: 'b0b0b0b0-1111-4222-8333-444455556666' },
 }
 
-/** A tool-result message: the loop claims it, but no human typed it. */
-const TOOL_MESSAGE: FakeMessage = { source: { kind: 'tool' } }
-
 /** The event a real committed user message carries. */
 const USER_EVENT = { type: 'user/message', data: { source: { kind: 'user' } } }
 
-/** Narrow the single recorded append, failing loudly on zero or many. */
-function onlyAppend(session: FakeSession): RewindAppend {
-  assert.equal(session.appends.length, 1, 'expected exactly one append')
-  const append = session.appends[0]
+/** Narrow the single non-boundary append, failing loudly on zero or many. */
+function onlyMessageAppend(session: FakeSession): RecordedAppend {
+  const messages = session.appends.filter(append => append.type === 'system/message')
+  assert.equal(messages.length, 1, 'expected exactly one message append')
+  const append = messages[0]
   assert.ok(append !== undefined)
   return append
 }
+
+// ---------------------------------------------------------------------------
+// /redo — retract now
+// ---------------------------------------------------------------------------
+
+test('the command retracts immediately inside a Turn it opens and closes', () => {
+  const nodes = [1, 4, 12, 20, 33]
+  const target = 12
+  const { ctx, agent, session } = harness(nodes, new Map([[target, USER_EVENT]]), [
+    { type: 'turn/start', data: { turn: 6 } },
+    { type: 'turn/end', data: { turn: 6 } },
+  ])
+
+  assert.deepEqual(runCommand(ctx, agent, ` ${String(target)}`), { kind: 'success' })
+
+  const shadowed = nodes.slice(nodes.indexOf(target))
+  assert.deepEqual(session.appends.map(append => append.type), [
+    'turn/start', 'step/start', 'system/message', 'step/end', 'turn/end',
+  ])
+
+  const [turnStart, stepStart, message, stepEnd, turnEnd] = session.appends
+  // The Turn follows the log, not the wall clock: the loop opens 8 next.
+  assert.deepEqual(turnStart?.data, { turn: 7 })
+  assert.deepEqual(stepStart?.data, { turn: 7, step: 1 })
+  assert.deepEqual(message?.data.turn, 7)
+  assert.deepEqual(message?.data.step, 1)
+  assert.deepEqual(stepEnd?.data, { turn: 7, step: 1 })
+  assert.deepEqual(turnEnd?.data, { turn: 7, reason: { kind: 'completed' } })
+
+  // Constraint: exactly one replacement, spanning the target through the tail.
+  assert.deepEqual(message?.options?.surfaceOp, {
+    op: 'replace',
+    startSeq: shadowed[0],
+    endSeq: shadowed.at(-1),
+  })
+  // Constraint: `sourceEventSeqs` covers every shadowed surface node, no more.
+  assert.deepEqual([...(message?.options?.sourceEventSeqs ?? [])], shadowed)
+})
+
+test('the replacement is an empty system node and never a user message', () => {
+  const { ctx, agent, session } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
+
+  runCommand(ctx, agent, '9')
+
+  const message = onlyMessageAppend(session)
+  assert.equal(message.data.message?.role, 'system')
+  assert.deepEqual([...(message.data.message?.content ?? [])], [])
+  assert.notEqual(message.data.message?.source.kind, 'user')
+})
+
+test('a session with no Turn yet starts the retraction at Turn 1', () => {
+  const { ctx, agent, session } = harness([1, 9], new Map([[9, USER_EVENT]]))
+
+  runCommand(ctx, agent, '9')
+
+  assert.deepEqual(session.appends[0]?.data, { turn: 1 })
+})
+
+test('a retraction never leaves a Step open', () => {
+  const { ctx, agent, session } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
+
+  runCommand(ctx, agent, '9')
+
+  const tail = session.appends.slice(-2).map(append => append.type)
+  assert.deepEqual(tail, ['step/end', 'turn/end'])
+})
+
+test('each retraction mints a fresh empty node identity', () => {
+  const first = harness([1, 9], new Map([[9, USER_EVENT]]))
+  runCommand(first.ctx, first.agent, '9')
+  const second = harness([1, 9], new Map([[9, USER_EVENT]]))
+  runCommand(second.ctx, second.agent, '9')
+
+  assert.notEqual(
+    onlyMessageAppend(first.session).data.message?.id,
+    onlyMessageAppend(second.session).data.message?.id,
+  )
+})
+
+test('the command refuses what the rewind would refuse, and bad arguments', () => {
+  const assistant = { type: 'assistant/message', data: { source: { kind: 'assistant' } } }
+  const events = new Map<number, unknown>([[1, USER_EVENT], [9, assistant], [17, USER_EVENT]])
+  const { ctx, agent, session } = harness([1, 9, 17], events)
+
+  for (const rawInput of ['', 'abc', '0x10', '9.5', '-3']) {
+    const result = runCommand(ctx, agent, rawInput) as { kind: string }
+    assert.equal(result.kind, 'error', `accepted ${JSON.stringify(rawInput)}`)
+  }
+  // A target outside the surface, the protected head, and a non-human node.
+  for (const rawInput of ['42', '1', '9']) {
+    const result = runCommand(ctx, agent, rawInput) as { kind: string }
+    assert.equal(result.kind, 'error', `accepted ${rawInput}`)
+  }
+  assert.equal(session.appends.length, 0, 'a refused command must not touch the log')
+
+  // A valid target still retracts after those refusals.
+  assert.deepEqual(runCommand(ctx, agent, '17'), { kind: 'success' })
+  assert.equal(onlyMessageAppend(session).options?.surfaceOp.startSeq, 17)
+})
+
+// ---------------------------------------------------------------------------
+// redo:<seq>:<uuid> — retry inside the claiming step
+// ---------------------------------------------------------------------------
 
 test('the rewind shadows the whole surface tail in one append inside the open step', async () => {
   const nodes = [1, 4, 12, 20, 33]
@@ -180,7 +304,7 @@ test('the rewind shadows the whole surface tail in one append inside the open st
   await emit(ctx, 'agent/pre-step', { agent, messages: [redoMessage(target)], turn, step })
   await emit(ctx, 'agent/request', { agent, turn, step })
 
-  const append = onlyAppend(session)
+  const append = onlyMessageAppend(session)
   const shadowed = nodes.slice(nodes.indexOf(target))
 
   assert.equal(append.type, 'system/message')
@@ -188,52 +312,17 @@ test('the rewind shadows the whole surface tail in one append inside the open st
   // coordinates, or the next cold read rejects the log as corrupt.
   assert.equal(append.data.turn, turn)
   assert.equal(append.data.step, step)
-  // Constraint: exactly one replacement, spanning the target through the tail.
-  assert.deepEqual(append.options.surfaceOp, {
+  assert.deepEqual(append.options?.surfaceOp, {
     op: 'replace',
     startSeq: shadowed[0],
     endSeq: shadowed.at(-1),
   })
-  // Constraint: `sourceEventSeqs` covers every shadowed surface node, no more.
-  assert.deepEqual([...append.options.sourceEventSeqs], shadowed)
-  // The replacement must project to no model message: a system node with empty
-  // content. An empty user message would be sent to the provider.
-  assert.equal(append.data.message.role, 'system')
-  assert.deepEqual([...append.data.message.content], [])
+  assert.deepEqual([...(append.options?.sourceEventSeqs ?? [])], shadowed)
+  assert.equal(append.data.message?.role, 'system')
+  assert.deepEqual([...(append.data.message?.content ?? [])], [])
 })
 
-test('the replacement never takes the shape of a user message', async () => {
-  const nodes = [1, 9, 17]
-  const { ctx, session, agent } = harness(nodes, new Map([[9, USER_EVENT]]))
-
-  await emit(ctx, 'agent/pre-step', { agent, messages: [redoMessage(9)], turn: 3, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
-
-  assert.equal(session.appends.length, 1)
-  for (const append of session.appends) {
-    assert.equal(append.type, 'system/message')
-    assert.notEqual(append.data.message.source.kind, 'user')
-  }
-})
-
-test('each rewind mints a fresh empty node identity', async () => {
-  const nodes = [1, 9, 17]
-  const events = new Map<number, unknown>([[9, USER_EVENT]])
-  const first = harness(nodes, events)
-  await emit(first.ctx, 'agent/pre-step', { agent: first.agent, messages: [redoMessage(9)], turn: 3, step: 1 })
-  await emit(first.ctx, 'agent/request', { agent: first.agent, turn: 3, step: 1 })
-
-  const second = harness(nodes, events)
-  await emit(second.ctx, 'agent/pre-step', { agent: second.agent, messages: [redoMessage(9)], turn: 3, step: 1 })
-  await emit(second.ctx, 'agent/request', { agent: second.agent, turn: 3, step: 1 })
-
-  assert.notEqual(
-    onlyAppend(first.session).data.message.id,
-    onlyAppend(second.session).data.message.id,
-  )
-})
-
-test('an ordinary prompt with no arm passes through untouched', async () => {
+test('an ordinary prompt rewinds nothing', async () => {
   const { ctx, session, agent } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
 
   await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn: 3, step: 1 })
@@ -316,7 +405,7 @@ test('a node that is not a human user message cannot be rewound', async () => {
   )
 })
 
-test('a disposed agent drops its pending plan and its arm', async () => {
+test('a disposed agent drops its pending retry', async () => {
   const { ctx, session, agent } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
 
   await emit(ctx, 'agent/pre-step', { agent, messages: [redoMessage(9)], turn: 3, step: 1 })
@@ -324,124 +413,4 @@ test('a disposed agent drops its pending plan and its arm', async () => {
   await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
 
   assert.equal(session.appends.length, 0)
-
-  const armed = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
-  assert.deepEqual(runCommand(armed.ctx, armed.agent, ' 9'), { kind: 'success' })
-  await emit(armed.ctx, 'agent/disposed', { agent: armed.agent })
-  await emit(armed.ctx, 'agent/pre-step', { agent: armed.agent, messages: [HUMAN_PROMPT], turn: 4, step: 1 })
-  await emit(armed.ctx, 'agent/request', { agent: armed.agent, turn: 4, step: 1 })
-  assert.equal(armed.session.appends.length, 0)
-})
-
-test('an armed composer rewrite turns the next human prompt into a rewind', async () => {
-  const nodes = [1, 9, 17, 24]
-  const target = 9
-  const turn = 5
-  const step = 1
-  const { ctx, session, agent } = harness(nodes, new Map([[target, USER_EVENT]]))
-
-  // The click: the client arms through the command, then refills the composer.
-  assert.deepEqual(runCommand(ctx, agent, ` ${String(target)}`), { kind: 'success' })
-  assert.equal(session.appends.length, 0)
-
-  // The send: an ordinary composer prompt, with no redo request id.
-  await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn, step })
-  await emit(ctx, 'agent/request', { agent, turn, step })
-
-  const append = onlyAppend(session)
-  const shadowed = nodes.slice(nodes.indexOf(target))
-  assert.equal(append.data.turn, turn)
-  assert.equal(append.data.step, step)
-  assert.deepEqual(append.options.surfaceOp, {
-    op: 'replace',
-    startSeq: shadowed[0],
-    endSeq: shadowed.at(-1),
-  })
-  assert.deepEqual([...append.options.sourceEventSeqs], shadowed)
-})
-
-test('an arm is consumed by exactly one prompt', async () => {
-  const { ctx, session, agent } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
-
-  runCommand(ctx, agent, '9')
-  await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn: 3, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
-  assert.equal(session.appends.length, 1)
-
-  // The message after the rewrite is an ordinary one.
-  await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn: 4, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 4, step: 1 })
-  assert.equal(session.appends.length, 1)
-})
-
-test('a tool step does not consume the arm', async () => {
-  const { ctx, session, agent } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
-
-  runCommand(ctx, agent, '9')
-  await emit(ctx, 'agent/pre-step', { agent, messages: [TOOL_MESSAGE], turn: 3, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
-  assert.equal(session.appends.length, 0)
-
-  await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn: 3, step: 2 })
-  await emit(ctx, 'agent/request', { agent, turn: 3, step: 2 })
-  assert.equal(session.appends.length, 1)
-})
-
-test('an expired arm is dropped instead of rewriting a later message', async (t) => {
-  let clock = Date.now()
-  t.mock.method(Date, 'now', () => clock)
-  const { ctx, session, agent } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
-
-  runCommand(ctx, agent, '9')
-  // A day later the click no longer explains anything the human sends.
-  clock += 24 * 60 * 60 * 1000
-  await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn: 3, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
-
-  assert.equal(session.appends.length, 0)
-})
-
-test('/redo off disarms a pending rewrite', async () => {
-  const { ctx, session, agent } = harness([1, 9, 17], new Map([[9, USER_EVENT]]))
-
-  runCommand(ctx, agent, '9')
-  assert.deepEqual(runCommand(ctx, agent, 'off'), { kind: 'success' })
-  await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn: 3, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
-
-  assert.equal(session.appends.length, 0)
-})
-
-test('an explicit retry outranks an armed rewrite and clears it', async () => {
-  const nodes = [1, 9, 17, 24, 31]
-  const events = new Map<number, unknown>([[17, USER_EVENT], [31, USER_EVENT]])
-  const { ctx, session, agent } = harness(nodes, events)
-
-  runCommand(ctx, agent, '9')
-  await emit(ctx, 'agent/pre-step', { agent, messages: [redoMessage(17)], turn: 3, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
-
-  assert.equal(onlyAppend(session).options.surfaceOp.startSeq, 17)
-
-  // The arm must be gone: the next ordinary prompt is an ordinary prompt.
-  await emit(ctx, 'agent/pre-step', { agent, messages: [HUMAN_PROMPT], turn: 4, step: 1 })
-  await emit(ctx, 'agent/request', { agent, turn: 4, step: 1 })
-  assert.equal(session.appends.length, 1)
-})
-
-test('the command refuses what the rewind would refuse, and bad arguments', async () => {
-  const assistant = { type: 'assistant/message', data: { source: { kind: 'assistant' } } }
-  const events = new Map<number, unknown>([[1, USER_EVENT], [9, assistant], [17, USER_EVENT]])
-  const { ctx, agent } = harness([1, 9, 17], events)
-
-  for (const rawInput of ['', 'abc', '0x10', '9.5', '-3']) {
-    const result = runCommand(ctx, agent, rawInput) as { kind: string }
-    assert.equal(result.kind, 'error', `accepted ${JSON.stringify(rawInput)}`)
-  }
-  for (const rawInput of ['42', '1', '9']) {
-    const result = runCommand(ctx, agent, rawInput) as { kind: string }
-    assert.equal(result.kind, 'error', `accepted ${rawInput}`)
-  }
-  // A valid target still arms after those refusals.
-  assert.deepEqual(runCommand(ctx, agent, '17'), { kind: 'success' })
 })

@@ -1,0 +1,62 @@
+name: Release
+
+# Tag-driven publishing. `git push origin v0.2.1` is the whole release.
+#
+# The package is linked to this workflow through npm trusted publishing (OIDC), so no token is
+# stored anywhere: the runner asks npm for a short-lived credential and npm verifies that the
+# claim comes from this repository and this exact file. Renaming or moving this workflow breaks
+# that link and the publish step starts failing with a 403 — update the trusted publisher on
+# npmjs.com in the same change.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Pack and verify without publishing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag is the source of truth for what ships; a shallow clone hides it.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1; the version bundled with Node 24 is close
+      # enough that pinning the floor here beats a mysterious 403 later.
+      - run: npm install -g npm@^11.5.1
+
+      - run: npm ci
+
+      # The tag and the manifest must agree, or the registry keeps a version nobody asked for.
+      - name: Check the tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(node -p 'require("./package.json").version')"
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag v$tag does not match package.json $manifest" >&2
+            exit 1
+          fi
+
+      # prepublishOnly runs typecheck, tests, and the build; this step only proves the tarball
+      # contains what we expect before anything reaches the registry.
+      - run: npm pack --dry-run
+
+      - name: Publish
+        if: github.event_name == 'push' || inputs.dry-run == false
+        run: npm publish --provenance --access public

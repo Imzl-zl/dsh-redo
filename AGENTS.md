@@ -8,10 +8,11 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
 - **运行中的 DSH**：打包版 `D:\soft\DeepSeek Harness\resources\app.asar\dsh\`；Web GUI 端口每次启动都会变，
   以运行时给的 URL 为准，不要把端口写死。
 - 本仓库是**外挂插件**，不改上游源码；上游只读引用。
-- **已发布 npm**：`dsh-redo`（scoped 无，账号 `imzl`，`latest` = 0.2.0）。发布用 `npm publish`；
-  npm 现在是**暂存发布**流程：新包名先落 `0.0.0-stage` 占位、真版本进审核，几分钟后自动成为 `latest`。
-  新包首发前的 2FA 需要网页端完成（CLI 的 EOTP 链接会被 npm 打码）；临时 granular token 走
-  `--//registry.npmjs.org/:_authToken=...` 传入，用完**立刻在网页删掉**。
+- **已发布 npm**：`dsh-redo`（无 scope，公开，账号 `imzl`）。**发版只走 tag 驱动的 CI**，见下文「发版」。
+  紧急情况下的手工发布事实（踩过一次，别重复踩）：npm 对新包首发用**暂存发布**，先落 `0.0.0-stage`
+  占位、真版本进审核、几分钟后自动成为 `latest`；`npm publish` 要求 2FA 时给的网页链接会被 npm
+  打成 `***`，所以只能网页建临时 granular token 并用 `--//registry.npmjs.org/:_authToken=…` 传入
+  （`NODE_AUTH_TOKEN` 会被 `~/.npmrc` 的 web token 盖掉），发完**立刻在网页删掉**。
 - **测试渠道**：`redo-test` profile 固定走本地 Cherry 免费网关（`http://127.0.0.1:23333/v1`，
   模型 `8497f00c-73d9-4f57-8634-78cb69e0f81a:auto`，key 用凭据里的 `CHERRY_API_KEY`）；测试不要走官方渠道。
 - 结论与接入点调研见 [docs/research/2026-10-24-edit-resend-seams.md](docs/research/2026-10-24-edit-resend-seams.md)。
@@ -77,6 +78,21 @@ node scripts/dump-session.mjs <session.v4.jsonl.zstd>   # 解码会话日志
 ```
 
 上游源码仍**未安装依赖**；需要跑上游测试时才 `pnpm install`。
+
+## 发版（规范化流程，别再用临时 token）
+
+1. 改 `CHANGELOG.md`：把 `## [Unreleased]` 里的内容整理好（Keep a Changelog 格式，**每个版本标注对应的
+   DSH 版本**，因为本插件没有兼容垫片）。
+2. `npm version patch|minor|major` —— `preversion` 会先跑 `typecheck + test`，然后改版本号并打 `vX.Y.Z` tag。
+3. 把 CHANGELOG 的 `Unreleased` 段落改成刚发布的版本号（连同底部的 compare 链接），提交。
+4. `git push --follow-tags`。
+5. `.github/workflows/release.yml` 用 **npm trusted publishing（OIDC）** 发布并附 provenance：
+   它先核对 tag 与 `package.json` 一致、`npm pack --dry-run` 看产物，再 `npm publish --provenance`。
+   仓库里**不存任何 token**。
+
+**这个工作流文件被 npm 侧的 trusted publisher 按路径绑定**（org `Imzl-zl`、repo `dsh-redo`、
+workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置里同步改，否则发布 403。
+首次配置那一次需要网页端 2FA，属于一次性的。
 
 ## 已验证
 

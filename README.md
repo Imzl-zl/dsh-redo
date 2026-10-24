@@ -3,6 +3,7 @@
   <h1>dsh-redo</h1>
   <p>编辑或重试已经发出去的用户消息，并原地重新生成——不新建会话、不重开对话。</p>
   <p>
+    <a href="https://www.npmjs.com/package/dsh-redo"><img src="https://img.shields.io/npm/v/dsh-redo?style=flat-square&color=CB3837" alt="npm version"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3da639?style=flat-square" alt="License: MIT"></a>
     <img src="https://img.shields.io/badge/DSH-0.2.x-4D6BFE?style=flat-square" alt="DeepSeek Harness 0.2.x">
     <img src="https://img.shields.io/badge/platform-web-6B7280?style=flat-square" alt="Platform: web">
@@ -167,9 +168,25 @@ node scripts/dump-session.mjs <session.v4.jsonl.zstd>   # 解码会话日志排�
 ```
 
 产物 `lib/` 不入库，克隆后需要先构建。宿主半只依赖 `node:crypto`；浏览器半只要求 shell 模块表里的
-`react` / `react-dom`，运行时不会装出第二份框架实例。
+`react`，运行时不会装出第二份框架实例。
 
 问题与建议欢迎开 issue / PR。
+
+## 变更记录与发版
+
+每个版本都记在 [CHANGELOG.md](CHANGELOG.md)，并标注它是针对哪个 DSH 版本构建的。
+
+发版是 **tag 驱动**的，不需要任何人手上有 token：
+
+```sh
+npm version patch        # 先跑 typecheck + 测试，再改版本号并打 tag
+# 把 CHANGELOG 的 Unreleased 段落改成这个版本号
+git push --follow-tags
+```
+
+`.github/workflows/release.yml` 会核验 tag 与 `package.json` 一致，然后通过 **npm trusted publishing
+（OIDC）** 发布并附 provenance。这个工作流文件被 npm 侧的 trusted publisher 配置按路径绑定，重命名或挪位置
+会让发布在 403 上失败——改路径时要去 npmjs.com 同步改一次。
 
 ## 友链
 

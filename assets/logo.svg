@@ -1,0 +1,23 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tile" x1="32" y1="16" x2="224" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#232733"/>
+      <stop offset="1" stop-color="#0B0C10"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="70" y1="62" x2="190" y2="176" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#CFD6E2"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(96 72) rotate(52) scale(150)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5B7BFF" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#5B7BFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#glow)"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="55.5" stroke="#FFFFFF" stroke-opacity=".10"/>
+  <path d="M64 90c0-14.359 11.641-26 26-26h76c14.359 0 26 11.641 26 26v44c0 14.359-11.641 26-26 26h-36l-26 22v-22h-14c-14.359 0-26-11.641-26-26V90Z" fill="url(#bubble)"/>
+  <g transform="translate(92 76) scale(4.5)" fill="none" stroke="#11131A" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.6V6h-3.4"/>
+  </g>
+</svg>

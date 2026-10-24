@@ -1,0 +1,7 @@
+# dsh-redo bundle layer.
+#
+# One host row. The browser half is discovered from this package's
+# package.json `dsh.client` declaration, so no second row is needed.
+- insert:
+    - id: redo
+      name: dsh-redo

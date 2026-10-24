@@ -1,16 +1,21 @@
 /**
  * dsh-redo — host half.
  *
- * Edits or retries a user message that has already been sent, in place: the
- * model context is rewound to just before that message, and the (edited) text
- * runs as an ordinary new turn. The session is append-only, so nothing is
- * deleted — one surface replacement shadows the old message and everything the
- * turns after it produced, and the replacement node itself projects to no
- * model message.
+ * Rewrites the model context in place from a chosen user message. Two entry
+ * points feed it, and both end in the same append:
  *
- * The client marks its redo prompt in the request id it already owns
- * (`redo:<targetSeq>:<uuid>`), so this half needs no Remote endpoint, no
- * generated artifacts, and no host RPC.
+ * - **Retry.** The client sends an ordinary prompt whose request id carries
+ *   `redo:<target>:<uuid>`, so `agent/pre-step` recognises the rewind from the
+ *   message the loop just claimed. Nothing else changes: the prompt text itself
+ *   is the regenerated message.
+ * - **Edit in the composer.** The client calls the `/redo <seq>` command, which
+ *   only *arms* a target; the user then edits and sends from the composer with
+ *   the identity the composer mints. The arm is a latch bound to one agent and
+ *   consumed by the next claimed human prompt, within {@link ARM_TTL_MS}.
+ *
+ * The session is append-only, so nothing is deleted — one surface replacement
+ * shadows the old message and everything the turns after it produced, and the
+ * replacement node itself projects to no model message.
  *
  * Two hooks, one plan:
  * - `agent/pre-step` sees the claimed messages and records which turn/step is
@@ -21,19 +26,41 @@
  *   else (for example between turns) leaves a log that a later JSONL read
  *   rejects as corrupt.
  *
+ * The armed latch is deliberately the destructive kind of state: if it is stale
+ * it rewrites a message the human did not mean. {@link ARM_TTL_MS} bounds that,
+ * the next human prompt consumes it, and an explicit `redo:` request id always
+ * wins over it.
+ *
  * @module dsh-redo
  */
 
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import type { SessionSeq } from '@deepseek-ai/dsh-session'
 
 export const name = 'redo'
-export const inject = ['agents']
+export const inject = ['agents', 'commands']
 
-/** Prefix the client writes into the prompt request id. */
+/** Prefix the client writes into the prompt request id of a retry. */
 const REDO_PREFIX = 'redo:'
+
+/**
+ * The target seq as the client mints it: digits, then the uuid fence.
+ *
+ * Digits only on purpose. `Number()` would accept `''` as 0, `'0x10'` as 16,
+ * and `'1e3'` as 1000, so a malformed request id could name a seq the human
+ * never asked for — and 0 is the protected session head, which turns a junk
+ * id into a host error instead of a no-op.
+ */
+const REDO_REQUEST_ID = /^(\d+):/
+
+/** How long an armed composer rewrite waits for the next human prompt. */
+const ARM_TTL_MS = 5 * 60 * 1000
+
+/** What the `/redo` command accepts. */
+const ARM_USAGE = '/redo <message seq>|off'
 
 /** One pending rewind, recorded at pre-step and consumed at request. */
 interface RedoPlan {
@@ -41,6 +68,42 @@ interface RedoPlan {
   readonly step: number
   /** Session seq of the user message the human asked to redo. */
   readonly target: number
+}
+
+/** One armed composer rewrite, waiting for the next human prompt. */
+interface ArmedTarget {
+  /** Session seq the next prompt should rewrite. */
+  readonly target: number
+  /** Unix epoch ms of the arming click, bounded by {@link ARM_TTL_MS}. */
+  readonly at: number
+}
+
+/** Why a target cannot be rewound. */
+type TargetRefusal = 'missing' | 'head' | 'not-user'
+
+/** Host-facing text for one refusal, thrown into the turn. */
+const REFUSAL_THROWN: Record<TargetRefusal, string> = {
+  missing: 'is no longer part of the active context',
+  head: 'is the protected session head',
+  'not-user': 'is not a human user message',
+}
+
+/** Human-facing text for one refusal, returned as the command result. */
+const REFUSAL_SHOWN: Record<TargetRefusal, string> = {
+  missing: 'that message is no longer part of the conversation context',
+  head: 'the first message of a session cannot be rewritten',
+  'not-user': 'only a message you sent can be rewritten',
+}
+
+/**
+ * Whether one claimed message is a human prompt the composer sent.
+ * @param source - the claimed message's producer source.
+ * @returns true for a user prompt, which carries a client-minted request id.
+ */
+function isHumanPrompt(source: unknown): boolean {
+  if (typeof source !== 'object' || source === null) return false
+  const record = source as { kind?: unknown; rpcId?: unknown }
+  return record.kind === 'user' && typeof record.rpcId === 'string'
 }
 
 /**
@@ -53,8 +116,30 @@ function redoTarget(source: unknown): number | undefined {
   const record = source as { kind?: unknown; rpcId?: unknown }
   if (record.kind !== 'user' || typeof record.rpcId !== 'string') return undefined
   if (!record.rpcId.startsWith(REDO_PREFIX)) return undefined
-  const parsed = Number(record.rpcId.slice(REDO_PREFIX.length).split(':')[0])
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+  const match = REDO_REQUEST_ID.exec(record.rpcId.slice(REDO_PREFIX.length))
+  if (match === null) return undefined
+  const parsed = Number(match[1])
+  return Number.isSafeInteger(parsed) ? parsed : undefined
+}
+
+/**
+ * Whether `target` can be rewritten right now.
+ * @param agent - agent whose session surface is inspected.
+ * @param target - session seq the human asked to redo.
+ * @returns the refusal, or undefined when the rewind is legal.
+ */
+function refusalOf(agent: Agent, target: number): TargetRefusal | undefined {
+  const session = agent.session
+  const nodes = [...session.surface.nodes]
+  const start = nodes.indexOf(target as SessionSeq)
+  if (start < 0) return 'missing'
+  if (start === 0) return 'head'
+  // Existing-history read: the owning turn already committed this message, and
+  // the sync reader is the only accessor available from an agent scope here.
+  // oxlint-disable-next-line typescript/no-deprecated -- guarded legacy history read
+  const event = session.eventAt(target as SessionSeq)
+  if (event?.type !== 'user/message' || event.data.source.kind !== 'user') return 'not-user'
+  return undefined
 }
 
 /**
@@ -73,24 +158,11 @@ function redoTarget(source: unknown): number | undefined {
  *   human user message.
  */
 function rewind(agent: Agent, target: number, turn: number, step: number): void {
-  const session = agent.session
-  const nodes = [...session.surface.nodes]
-  const start = nodes.indexOf(target as SessionSeq)
-  if (start < 0) {
-    throw new Error(`redo: message ${target} is no longer part of the active context`)
-  }
-  if (start === 0) {
-    throw new Error(`redo: message ${target} is the protected session head`)
-  }
-  // Existing-history read: the owning turn already committed this message, and
-  // the sync reader is the only accessor available from an agent scope here.
-  // oxlint-disable-next-line typescript/no-deprecated -- guarded legacy history read
-  const event = session.eventAt(target as SessionSeq)
-  if (event?.type !== 'user/message' || event.data.source.kind !== 'user') {
-    throw new Error(`redo: message ${target} is not a human user message`)
-  }
-  const shadowed = nodes.slice(start)
-  session.append('system/message', {
+  const why = refusalOf(agent, target)
+  if (why !== undefined) throw new Error(`redo: message ${target} ${REFUSAL_THROWN[why]}`)
+  const nodes = [...agent.session.surface.nodes]
+  const shadowed = nodes.slice(nodes.indexOf(target as SessionSeq))
+  agent.session.append('system/message', {
     turn,
     step,
     message: {
@@ -107,18 +179,64 @@ function rewind(agent: Agent, target: number, turn: number, step: number): void 
 }
 
 /**
- * Install the redo action on every agent.
- * @param ctx - host context carrying the agent registry.
+ * Parse the `/redo` argument.
+ * @param rawInput - command text after the verb, verbatim.
+ * @returns the armed target, `'off'` to disarm, or undefined when malformed.
+ */
+function parseArmTarget(rawInput: string): number | 'off' | undefined {
+  const trimmed = rawInput.trim()
+  if (trimmed === 'off') return 'off'
+  if (!/^\d+$/u.test(trimmed)) return undefined
+  const parsed = Number(trimmed)
+  return Number.isSafeInteger(parsed) ? parsed : undefined
+}
+
+/**
+ * Install the redo hooks and the arming command.
+ * @param ctx - host context carrying the agent registry and the command registry.
  */
 export function apply(ctx: Context): void {
   const plans = new WeakMap<Agent, RedoPlan>()
+  const armed = new WeakMap<Agent, ArmedTarget>()
+
+  // Programmatic arming: the client half calls this to turn the *next* composer
+  // send into a rewrite, which is the only way to keep the composer native —
+  // its submission request id is minted by the composer and cannot be injected.
+  ctx.effect(() => ctx.commands.register({
+    name: 'redo',
+    description: 'Rewrite the conversation from an earlier message: the next message you send replaces it',
+    input: { hint: '<message seq>|off' },
+    handler: (invocation: CommandInvocation): CommandResult => {
+      const parsed = parseArmTarget(invocation.rawInput)
+      if (parsed === undefined) return { kind: 'error', text: `redo: usage ${ARM_USAGE}` }
+      if (parsed === 'off') {
+        armed.delete(invocation.agent)
+        return { kind: 'success' }
+      }
+      const why = refusalOf(invocation.agent, parsed)
+      if (why !== undefined) return { kind: 'error', text: `redo: ${REFUSAL_SHOWN[why]}` }
+      armed.set(invocation.agent, { target: parsed, at: Date.now() })
+      return { kind: 'success' }
+    },
+  }), 'dsh-redo: redo command')
 
   ctx.on('agent/pre-step', async ({ agent, messages, turn, step }, next) => {
-    for (const message of messages) {
-      const target = redoTarget(message.source)
-      if (target === undefined) continue
-      plans.set(agent, { turn, step, target })
-      break
+    const explicit = messages
+      .map(message => redoTarget(message.source))
+      .find(target => target !== undefined)
+    if (explicit !== undefined) {
+      // A retry names its own target, so it outranks anything waiting in the
+      // composer — and the client that sent it expects exactly that interval.
+      armed.delete(agent)
+      plans.set(agent, { turn, step, target: explicit })
+      return next()
+    }
+    const pending = armed.get(agent)
+    if (pending !== undefined && messages.some(message => isHumanPrompt(message.source))) {
+      // One arm, one prompt: consume it even when it has expired, so a stale
+      // click cannot rewrite an unrelated message later in the session.
+      armed.delete(agent)
+      if (Date.now() - pending.at <= ARM_TTL_MS) plans.set(agent, { turn, step, target: pending.target })
     }
     return next()
   })
@@ -132,5 +250,8 @@ export function apply(ctx: Context): void {
     return next()
   })
 
-  ctx.on('agent/disposed', ({ agent }) => { plans.delete(agent) })
+  ctx.on('agent/disposed', ({ agent }) => {
+    plans.delete(agent)
+    armed.delete(agent)
+  })
 }

@@ -2,37 +2,44 @@
  * dsh-redo — browser half.
  *
  * Replaces the keyed `user` Chat node cell so one human message gains two
- * actions: retry it as-is, or edit it (text and images) and resend. Both send
- * through the ordinary prompt Remote with a `redo:` request id; the host half
- * turns that prompt into an in-place rewind, so this half never touches the
- * session log.
+ * actions: retry it as-is, or move it back into the composer and let the next
+ * send rewrite it. Retry sends through the ordinary prompt Remote with a
+ * `redo:` request id; edit only *arms* the Host through the `/redo <seq>`
+ * command and refills the composer, so the send itself is an ordinary composer
+ * submission — the same one the user would type by hand.
  *
  * Replacing an occupied keyed cell is a supported extension point, but it
  * means this package owns the user row's layout. The bubble itself is still
  * the shipped `conversation.chat.user.content` Factory, and the surrounding
  * chrome rebuilds what the shipped row had — clock and copy — so a message
- * loses nothing when this plugin is installed. Retry and edit sit next to the
+ * loses nothing when this plugin is installed. Both actions sit next to the
  * shipped affordances, use their metrics, and disappear into the same
  * hover-reveal behaviour the shipped row uses for older Turns.
  *
  * The log is append-only, so a rewind shadows an interval instead of deleting
  * it. This half therefore keeps a small registry of `[target, replacement)`
- * intervals read from every redo message it renders, dims the messages inside
- * them, and refuses a second rewind there instead of letting the Host throw
- * into the transcript.
+ * intervals, dims the messages inside them, and refuses a second rewind there
+ * instead of letting the Host throw into the transcript.
  *
- * Images can be removed and added in the editor: a stored image is read back
- * through `readAttachment` (the same RPC image rendering uses), and a newly
- * picked one is encoded in the browser. Files cannot ride this path — a prompt
- * file part is a receipt from a fresh upload and the client has no RPC that
- * reads an existing file attachment back — so a message carrying one keeps its
- * actions disabled instead of silently dropping content.
+ * A composer rewrite cannot mint its own request id — the composer owns it — so
+ * the durable `redo:` marker only exists on the retry path. For the composer
+ * path this half registers the interval as soon as the replacement message
+ * appears (`ARMED` below): the Host applies the armed rewrite to the very next
+ * message, which is exactly the rule used here. The interval registry is memory
+ * only, so dimmed history and the 「已重发」 badge survive a reload only for
+ * retry-shaped rewinds.
+ *
+ * Images ride the composer as drafts: stored bytes are read back through
+ * `readAttachment`, wrapped as a `File`, and staged with `createDrafts`. Files
+ * cannot ride this path — a prompt file part is a receipt from a fresh upload
+ * and the client has no RPC that reads an existing file attachment back — so a
+ * message carrying one keeps its actions disabled instead of silently dropping
+ * content.
  *
  * @module dsh-redo/client
  */
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { createPortal } from 'react-dom'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -44,12 +51,12 @@ import type {
 // Type-only: pulls the client Session service (`ctx.sessions`) and the SlotMap merge.
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-// Type-only: pulls `ctx.uiConversation` and the `chat` target snapshot merge.
+// Type-only: pulls `ctx.conversation`, `ctx.uiConversation`, and the `chat` target merge.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { en, zh, type RedoKey } from './locales.ts'
 
-export const inject = ['slots', 'sessions', 'uiConversation', 'locale']
+export const inject = ['slots', 'sessions', 'conversation', 'uiConversation', 'locale']
 
 /** Dictionary namespace owned by this plugin. */
 const NS = 'redo'
@@ -57,12 +64,12 @@ const NS = 'redo'
 /** Title/summary shown in the Plugins page for this browser contribution. */
 export const description = 'Edit or retry a sent user message and regenerate in place'
 
-/** Outcome of one redo submission, already localized by the caller. */
+/** Outcome of one redo action, already localized by the caller. */
 type RedoResult =
   | { readonly ok: true }
   | {
     readonly ok: false
-    readonly code: 'not-open' | 'rejected' | 'attachment' | 'superseded' | 'running'
+    readonly code: 'not-open' | 'rejected' | 'command' | 'attachment' | 'superseded' | 'running'
     readonly message?: string
   }
 
@@ -72,13 +79,27 @@ type RedoFailure = Extract<RedoResult, { readonly ok: false }>
 /** Image media types the prompt channel accepts. */
 type ImageMediaType = ImageAttachmentRef['mediaType']
 
-/** One image part: a stored image to read back, or bytes already in hand. */
-type ImagePart =
+/** One part a retry re-sends: the message text, or a stored image read back by bytes. */
+type RedoPart =
+  | { readonly type: 'text'; readonly text: string }
   | { readonly type: 'image'; readonly attachment: ImageAttachmentRef }
-  | { readonly type: 'image'; readonly mediaType: ImageMediaType; readonly data: string; readonly name?: string }
 
-/** One part this plugin re-sends: the edited text, or an image. */
-type RedoPart = { readonly type: 'text'; readonly text: string } | ImagePart
+/** Full props of the replaced user-message cell. */
+type RedoUserMessageProps = Omit<ChatNodeViewProps<'user'>, 't'> & PropsLocale<'redo'> & InjectFace<RedoInjected>
+
+/** Request-id type of the Session prompt call. */
+type PromptRequestId = NonNullable<Parameters<SessionFace['prompt']>[3]>
+
+/** Content parts accepted by the Session prompt call. */
+type PromptParts = Parameters<SessionFace['prompt']>[0]
+
+/** One composer draft id, derived from the published input actions. */
+type DraftId = Parameters<RedoUserMessageProps['inputActions']['addAttachments']>[0][number]
+
+/** What arming one composer rewrite produced. */
+type ArmResult =
+  | { readonly ok: true; readonly draftIds: readonly DraftId[] }
+  | RedoFailure
 
 /** Business face injected into the user-message row. */
 export interface RedoInjected {
@@ -88,12 +109,20 @@ export interface RedoInjected {
   readonly localeId: string
   /**
    * Rewind the model context to just before `target` and send `parts` as the
-   * next turn.
+   * next turn, without touching the composer.
    * @param target - session seq of the message being replaced.
    * @param parts - text and images to send, in display order.
    * @returns acceptance, or the failure the UI should show.
    */
   resend: (target: number, parts: readonly RedoPart[]) => Promise<RedoResult>
+  /**
+   * Arm the Host so the next message sent from this Session's composer rewrites
+   * `target`, and stage the message's images as composer drafts.
+   * @param target - session seq of the message being replaced.
+   * @param images - stored images to stage, in display order.
+   * @returns the draft ids the caller adds to the composer, or the failure to show.
+   */
+  arm: (target: number, images: readonly ImageAttachmentRef[]) => Promise<ArmResult>
   /**
    * Count the user Turns a rewind of `target` would remove: every later user
    * message still loaded in the Chat target. `undefined` when the count cannot
@@ -112,15 +141,6 @@ export interface RedoInjected {
   isRunning: () => boolean
 }
 
-/** Full props of the replaced user-message cell. */
-type RedoUserMessageProps = Omit<ChatNodeViewProps<'user'>, 't'> & PropsLocale<'redo'> & InjectFace<RedoInjected>
-
-/** Request-id type of the Session prompt call. */
-type PromptRequestId = NonNullable<Parameters<SessionFace['prompt']>[3]>
-
-/** Content parts accepted by the Session prompt call. */
-type PromptParts = Parameters<SessionFace['prompt']>[0]
-
 /** One shadowed interval: the redo target and the seq of its replacement. */
 interface SupersededRange {
   readonly from: number
@@ -135,6 +155,17 @@ interface SupersededRange {
 const RANGES = new Map<string, SupersededRange[]>()
 const RANGE_LISTENERS = new Set<() => void>()
 let rangeRevision = 0
+
+/**
+ * One armed composer rewrite whose replacement seq is not known yet. The Host
+ * applies an armed target to the next message the Session sends; this record
+ * lets the resulting row register the same interval the retry path learns from
+ * its request id.
+ */
+const ARMED = new Map<string, { readonly target: number; readonly at: number }>()
+
+/** How long an armed record is still assumed to explain the next message. */
+const ARM_WINDOW_MS = 10 * 60 * 1000
 
 /**
  * Record one replacement interval.
@@ -160,6 +191,18 @@ function isSupersededSeq(sessionId: string, seq: number): boolean {
   const ranges = RANGES.get(sessionId)
   if (ranges === undefined) return false
   return ranges.some(range => seq >= range.from && seq < range.to)
+}
+
+/**
+ * The seq one replacement swallowed.
+ * @param sessionId - owning Session.
+ * @param seq - candidate replacement seq.
+ * @returns the replaced seq, or undefined when this message is not a replacement.
+ */
+function replacedBySeq(sessionId: string, seq: number): number | undefined {
+  const ranges = RANGES.get(sessionId)
+  if (ranges === undefined) return undefined
+  return ranges.find(range => range.to === seq)?.from
 }
 
 /**
@@ -198,9 +241,9 @@ function contentParts(content: readonly unknown[]): {
   return { text: texts.join(''), attachments, rest }
 }
 
-/** What one durable message offers to the editor. */
+/** What one durable message offers to the redo actions. */
 interface RedoLayout {
-  /** Joined text of every text block, used to prefill the editor. */
+  /** Joined text of every text block, used to refill the composer. */
   readonly text: string
   /** Stored images in original order, each re-sendable by reading its bytes. */
   readonly images: readonly ImageAttachmentRef[]
@@ -213,7 +256,7 @@ interface RedoLayout {
 /**
  * Split durable content into the parts a redo can carry.
  * @param content - the message's durable content blocks.
- * @returns editor text, stored images, and refusal flags.
+ * @returns composer text, stored images, and refusal flags.
  */
 function redoLayout(content: readonly unknown[]): RedoLayout {
   const texts: string[] = []
@@ -231,8 +274,8 @@ function redoLayout(content: readonly unknown[]): RedoLayout {
 }
 
 /**
- * Build the prompt parts for one send: the text, then the images in display order.
- * @param text - editor text; blank text contributes no part.
+ * Build the prompt parts for one retry: the text, then the images in display order.
+ * @param text - message text; blank text contributes no part.
  * @param images - stored images, in display order.
  * @returns ordered prompt parts.
  */
@@ -253,23 +296,10 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(binary)
 }
 
-/** Base64-encode one picked file through the browser's own data-URL encoder. */
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      const url = typeof reader.result === 'string' ? reader.result : ''
-      resolve(url.slice(url.indexOf(',') + 1))
-    }
-    reader.onerror = () => { reject(reader.error ?? new Error('redo: image read failed')) }
-    reader.readAsDataURL(file)
-  })
-}
-
-/** Whether a picked file is an image type the prompt channel accepts. */
-function isAcceptedImage(file: File): boolean {
-  return file.type === 'image/png' || file.type === 'image/jpeg'
-    || file.type === 'image/webp' || file.type === 'image/gif'
+/** File-name extension for one accepted image media type. */
+function extensionOf(mediaType: ImageMediaType): string {
+  if (mediaType === 'image/jpeg') return 'jpg'
+  return mediaType.slice('image/'.length)
 }
 
 /** Write text the way the shipped message actions do, with a non-secure fallback. */
@@ -325,13 +355,17 @@ interface RedoMessageSource {
   readonly rpcId?: unknown
 }
 
-/** Whether this durable message was itself produced by a redo. */
+/** Request-id grammar the Host half mints for a retry: `redo:<seq>:<uuid>`. */
+const REDO_RPC_ID = /^redo:(\d+):/u
+
+/** Whether this durable message was itself produced by a retry. */
 function replacedFrom(source: unknown): number | undefined {
   if (typeof source !== 'object' || source === null) return undefined
   const { rpcId } = source as RedoMessageSource
-  if (typeof rpcId !== 'string' || !rpcId.startsWith('redo:')) return undefined
-  const parsed = Number(rpcId.slice('redo:'.length).split(':')[0])
-  return Number.isSafeInteger(parsed) ? parsed : undefined
+  if (typeof rpcId !== 'string') return undefined
+  const match = REDO_RPC_ID.exec(rpcId)
+  if (match === null) return undefined
+  return Number(match[1])
 }
 
 /** Prefer the platform UUID generator; fall back when the page is not a secure context. */
@@ -339,18 +373,6 @@ function uuid(): string {
   const generator = globalThis.crypto as { randomUUID?: () => string } | undefined
   if (typeof generator?.randomUUID === 'function') return generator.randomUUID()
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
-}
-
-/** One image in the editor: where it came from decides how it is sent. */
-interface EditorImage {
-  /** Stable React key. */
-  readonly key: string
-  /** The part this image becomes on send. */
-  readonly part: ImagePart
-  /** Preview URL already in hand (picked images only); stored images load in the dialog. */
-  readonly previewUrl: string | undefined
-  /** True when the preview URL is this editor's own object URL and must be revoked. */
-  readonly local: boolean
 }
 
 /** Shipped-style icon for the copy action. */
@@ -384,14 +406,15 @@ function CheckIcon() {
 }
 
 /**
- * One user bubble with its clock, copy, retry, and edit actions, the editor
- * dialog, and the inline confirmation a rewind needs.
- * @param props - node data, the shipped content Factory, copy, and redo actions.
+ * One user bubble with its clock, copy, retry, and edit actions, plus the
+ * inline confirmation a rewind needs.
+ * @param props - node data, the shipped content Factory, copy, the redo
+ *   actions, and the Session's published input face.
  * @returns the user row.
  */
 function RedoUserMessage({
-  node, renderFactorySlot, loadImage, t, resend, laterTurns, subscribeRunning, isRunning,
-  sessionId, localeId,
+  node, renderFactorySlot, loadImage, t, resend, arm, laterTurns, subscribeRunning, isRunning,
+  sessionId, localeId, inputActions, useInput,
 }: RedoUserMessageProps) {
   const data = node.data as UserMessageNode & {
     readonly referenceLabels?: readonly string[]
@@ -415,21 +438,34 @@ function RedoUserMessage({
   // the context dims without waiting for its own data to change.
   useSyncExternalStore(subscribeRanges, rangesRevision)
   const superseded = isSupersededSeq(scope, data.seq)
+  // Only the fields that matter here: the published input state carries much
+  // more, and depending on the whole shape would break on an upstream addition.
+  const composerOccupied = useInput((state: { readonly draft: string; readonly attachmentIds: readonly unknown[] }) =>
+    state.draft.trim() !== '' || state.attachmentIds.length > 0)
 
   useEffect(() => {
     if (replacementTarget === undefined) return
     registerReplacement(scope, replacementTarget, data.seq)
   }, [replacementTarget, scope, data.seq])
 
-  const [editing, setEditing] = useState(false)
+  // A composer rewrite leaves no request id behind: the composer mints its own.
+  // The Host applies an armed target to the Session's next message, so the first
+  // row newer than the target after arming IS the replacement.
+  useEffect(() => {
+    const record = ARMED.get(scope)
+    if (record === undefined) return
+    if (data.seq <= record.target) return
+    ARMED.delete(scope)
+    if (Date.now() - record.at > ARM_WINDOW_MS) return
+    registerReplacement(scope, record.target, data.seq)
+  }, [scope, data.seq])
+
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<string | undefined>(undefined)
-  const [confirming, setConfirming] = useState(false)
+  const [pending, setPending] = useState<'retry' | 'edit' | undefined>(undefined)
   const [dropCount, setDropCount] = useState<number | undefined>(undefined)
-  const [editorDrops, setEditorDrops] = useState<number | undefined>(undefined)
   const [copied, setCopied] = useState(false)
   const copyTimer = useRef<number | null>(null)
-  const editButton = useRef<HTMLButtonElement | null>(null)
 
   const layout = useMemo(() => redoLayout(data.content), [data.content])
   // Images are carried over by reading their bytes back; files are not, and an
@@ -446,6 +482,7 @@ function RedoUserMessage({
 
   const fail = useCallback((result: RedoFailure): string => {
     if (result.code === 'not-open') return t('error.notOpen')
+    if (result.code === 'command') return t('error.command')
     if (result.code === 'attachment') return t('error.attachment')
     if (result.code === 'superseded') return t('error.superseded')
     if (result.code === 'running') return t('error.running')
@@ -456,7 +493,7 @@ function RedoUserMessage({
     if (busy) return
     setBusy(true)
     setFailure(undefined)
-    setConfirming(false)
+    setPending(undefined)
     try {
       const result = await resend(data.seq, partsFor(layout.text, layout.images))
       if (!result.ok) setFailure(fail(result))
@@ -466,6 +503,29 @@ function RedoUserMessage({
       setBusy(false)
     }
   }, [busy, data.seq, fail, layout, resend])
+
+  const runEdit = useCallback(async () => {
+    if (busy) return
+    setBusy(true)
+    setFailure(undefined)
+    setPending(undefined)
+    try {
+      const staged = await arm(data.seq, layout.images)
+      if (!staged.ok) {
+        setFailure(fail(staged))
+        return
+      }
+      inputActions.setDraft(layout.text)
+      if (staged.draftIds.length > 0 && !inputActions.addAttachments(staged.draftIds)) {
+        setFailure(t('error.attachment'))
+        return
+      }
+    } catch (thrown) {
+      setFailure(thrown instanceof Error ? thrown.message : String(thrown))
+    } finally {
+      setBusy(false)
+    }
+  }, [arm, busy, data.seq, fail, inputActions, layout, t])
 
   const requestRetry = useCallback(() => {
     if (busy || !canRetry) return
@@ -478,21 +538,21 @@ function RedoUserMessage({
       return
     }
     setDropCount(later)
-    setConfirming(true)
+    setPending('retry')
   }, [busy, canRetry, data.seq, laterTurns, runRetry])
 
-  const openEditor = useCallback(() => {
-    if (!canEdit) return
-    setFailure(undefined)
-    setConfirming(false)
-    setEditorDrops(laterTurns(data.seq))
-    setEditing(true)
-  }, [canEdit, data.seq, laterTurns])
-
-  const closeEditor = useCallback(() => {
-    setEditing(false)
-    requestAnimationFrame(() => { editButton.current?.focus() })
-  }, [])
+  const requestEdit = useCallback(() => {
+    if (busy || !canEdit) return
+    const later = laterTurns(data.seq)
+    // Arming is the destructive step: the next send rewrites this message. Ask
+    // when that send would drop later turns, or would overwrite a live draft.
+    if (later === 0 && !composerOccupied) {
+      void runEdit()
+      return
+    }
+    setDropCount(later)
+    setPending('edit')
+  }, [busy, canEdit, composerOccupied, data.seq, laterTurns, runEdit])
 
   const copy = useCallback(async () => {
     if (parts.text === '' || copied) return
@@ -505,12 +565,11 @@ function RedoUserMessage({
     }, 1000)
   }, [copied, parts.text])
 
-  const initialImages = useMemo<EditorImage[]>(() => layout.images.map((attachment, index) => ({
-    key: `stored:${String(attachment.attachmentId)}:${String(index)}`,
-    part: { type: 'image', attachment },
-    previewUrl: undefined,
-    local: false,
-  })), [layout])
+  const confirmation = pending === 'retry'
+    ? dropCount === undefined ? t('confirm.unknown') : t('confirm.text', { count: dropCount })
+    : dropCount === undefined
+      ? t('confirm.editUnknown')
+      : dropCount === 0 ? t('confirm.edit') : t('confirm.editText', { count: dropCount })
 
   const retryTitle = superseded
     ? t('action.superseded')
@@ -521,7 +580,7 @@ function RedoUserMessage({
     ? t('action.superseded')
     : running
       ? t('action.running')
-      : editable ? t('action.edit') : t('action.unsupported')
+      : editable ? t('action.editHint') : t('action.unsupported')
   const copyTitle = parts.text === ''
     ? t('action.copyEmpty')
     : copied ? t('action.copied') : t('action.copy')
@@ -534,7 +593,7 @@ function RedoUserMessage({
       <div className="dsh-redo-meta">
         {superseded
           ? <span className="dsh-redo-flag" title={t('badge.supersededHint')}>{t('badge.superseded')}</span>
-          : replacementTarget === undefined
+          : replacementTarget === undefined && replacedBySeq(scope, data.seq) === undefined
             ? null
             : <span className="dsh-redo-flag" title={t('badge.replacedHint')}>{t('badge.replaced')}</span>}
         {typeof data.time === 'number'
@@ -578,7 +637,6 @@ function RedoUserMessage({
           </svg>
         </button>
         <button
-          ref={editButton}
           type="button"
           className="dsh-redo-action"
           aria-label={t('action.edit')}
@@ -588,7 +646,7 @@ function RedoUserMessage({
           data-busy={busy ? true : undefined}
           onClick={(event) => {
             event.stopPropagation()
-            openEditor()
+            requestEdit()
           }}
         >
           <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -601,407 +659,35 @@ function RedoUserMessage({
           </svg>
         </button>
       </div>
-      {confirming
-        ? (
+      {pending === undefined
+        ? null
+        : (
           <div className="dsh-redo-confirm" role="group" aria-label={t('confirm.title')}>
             <span className="dsh-redo-confirm-text">
-              {dropCount === undefined ? t('confirm.unknown') : t('confirm.text', { count: dropCount })}
+              {confirmation}
+              {pending === 'edit' && composerOccupied
+                ? <span className="dsh-redo-confirm-note">{t('confirm.editReplace')}</span>
+                : null}
             </span>
             <button
               type="button"
               className="dsh-redo-button dsh-redo-small"
-              onClick={() => { setConfirming(false) }}
+              onClick={() => { setPending(undefined) }}
             >
               {t('confirm.cancel')}
             </button>
             <button
               type="button"
               className="dsh-redo-button dsh-redo-small dsh-redo-danger"
-              onClick={() => { void runRetry() }}
+              onClick={() => { void (pending === 'retry' ? runRetry() : runEdit()) }}
             >
-              {t('confirm.go')}
+              {pending === 'retry' ? t('confirm.go') : t('confirm.goEdit')}
             </button>
           </div>
-        )
-        : null}
+        )}
       {failure === undefined ? null : <div className="dsh-redo-inline-error" role="alert">{failure}</div>}
-      {editing
-        ? (
-          <RedoDialog
-            initialText={layout.text}
-            initialImages={initialImages}
-            loadImage={loadImage}
-            droppedTurns={editorDrops}
-            t={t}
-            onCancel={closeEditor}
-            onSubmit={async (editorParts) => {
-              const result = await resend(data.seq, editorParts)
-              if (!result.ok) return fail(result)
-              closeEditor()
-              return undefined
-            }}
-          />
-        )
-        : null}
     </div>
   )
-}
-
-/**
- * The editor: text plus removable/added images. Enter sends from the textarea,
- * Shift+Enter breaks the line, Escape asks before discarding unsent changes.
- * @param props - original text and images, the image loader, the Turns a send
- *   would remove, cancellation, the send round-trip, and copy.
- * @returns the modal overlay.
- */
-function RedoDialog({
-  initialText, initialImages, loadImage, droppedTurns, onCancel, onSubmit, t,
-}: {
-  initialText: string
-  initialImages: readonly EditorImage[]
-  loadImage: RedoUserMessageProps['loadImage']
-  droppedTurns: number | undefined
-  onCancel: () => void
-  onSubmit: (parts: readonly RedoPart[]) => Promise<string | undefined>
-  t: RedoUserMessageProps['t']
-}) {
-  const [text, setText] = useState(initialText)
-  const [images, setImages] = useState<EditorImage[]>(() => [...initialImages])
-  const [previews, setPreviews] = useState<Readonly<Record<string, string>>>({})
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | undefined>(undefined)
-  const [picking, setPicking] = useState(false)
-  const [discarding, setDiscarding] = useState(false)
-  const input = useRef<HTMLTextAreaElement | null>(null)
-  const fileInput = useRef<HTMLInputElement | null>(null)
-  const overlay = useRef<HTMLDivElement | null>(null)
-  const dialog = useRef<HTMLDivElement | null>(null)
-  const titleId = useId()
-  const hintId = useId()
-
-  // The dialog is portaled to <body>, so the app behind it is inert while it is
-  // open: no pointer, focus, or screen-reader access to the transcript, and no
-  // wheel chaining into the conversation scroller. Restores whatever was there.
-  useEffect(() => {
-    const element = overlay.current
-    if (element === null) return
-    const inerted: HTMLElement[] = []
-    for (const child of [...document.body.children]) {
-      if (!(child instanceof HTMLElement) || child === element) continue
-      // Only rendered app roots matter; inert on script tags is pointless.
-      if (child.tagName === 'SCRIPT' || child.tagName === 'STYLE' || child.tagName === 'LINK'
-        || child.tagName === 'META' || child.tagName === 'TEMPLATE') continue
-      if (child.hasAttribute('inert')) continue
-      child.setAttribute('inert', '')
-      inerted.push(child)
-    }
-    const overflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    return () => {
-      for (const child of inerted) child.removeAttribute('inert')
-      document.body.style.overflow = overflow
-    }
-  }, [])
-
-  // Revoke only this dialog's own object URLs; stored-image addresses are not ours.
-  const localUrls = useRef<string[]>([])
-  useEffect(() => () => {
-    for (const url of localUrls.current) URL.revokeObjectURL(url)
-    localUrls.current = []
-  }, [])
-
-  useEffect(() => {
-    const element = input.current
-    if (element === null) return
-    element.focus()
-    element.setSelectionRange(element.value.length, element.value.length)
-  }, [])
-
-  // Stored images need an authorized URL from the session. Load them when the
-  // editor opens instead of warming every bubble in the transcript.
-  useEffect(() => {
-    let cancelled = false
-    void (async () => {
-      for (const image of initialImages) {
-        if (image.local || image.previewUrl !== undefined) continue
-        if (!('attachment' in image.part)) continue
-        const attachment = image.part.attachment
-        const cached = loadImage.peek?.(attachment)
-        const url = cached ?? await loadImage(attachment).catch(() => undefined)
-        if (url === undefined || cancelled) continue
-        setPreviews(current => current[image.key] === undefined ? { ...current, [image.key]: url } : current)
-      }
-    })()
-    return () => { cancelled = true }
-  }, [initialImages, loadImage])
-
-  const initialKeys = useMemo(() => imagesFromKeys(initialImages), [initialImages])
-  const dirty = text !== initialText || imagesFromKeys(images) !== initialKeys
-
-  const requestClose = useCallback(() => {
-    if (busy) return
-    if (dirty) {
-      setDiscarding(true)
-      return
-    }
-    onCancel()
-  }, [busy, dirty, onCancel])
-
-  const remove = useCallback((key: string) => {
-    setImages((current) => current.filter((image) => {
-      if (image.key !== key) return true
-      if (image.local && image.previewUrl !== undefined) URL.revokeObjectURL(image.previewUrl)
-      return false
-    }))
-  }, [])
-
-  const add = useCallback(async (files: FileList | null) => {
-    if (files === null || files.length === 0) return
-    setPicking(true)
-    setError(undefined)
-    try {
-      const additions: EditorImage[] = []
-      for (const file of files) {
-        if (!isAcceptedImage(file)) {
-          setError(t('error.imageType'))
-          continue
-        }
-        const data = await fileToBase64(file)
-        const previewUrl = URL.createObjectURL(file)
-        localUrls.current.push(previewUrl)
-        additions.push({
-          key: `picked:${uuid()}`,
-          part: {
-            type: 'image',
-            mediaType: file.type as ImageMediaType,
-            data,
-            ...file.name === '' ? {} : { name: file.name },
-          },
-          previewUrl,
-          local: true,
-        })
-      }
-      if (additions.length > 0) setImages(current => [...current, ...additions])
-    } catch (thrown) {
-      setError(thrown instanceof Error ? thrown.message : String(thrown))
-    } finally {
-      setPicking(false)
-      if (fileInput.current !== null) fileInput.current.value = ''
-    }
-  }, [t])
-
-  const submit = useCallback(async () => {
-    if (busy) return
-    const trimmed = text.trim()
-    if (trimmed === '' && images.length === 0) return
-    setBusy(true)
-    setError(undefined)
-    try {
-      const parts: RedoPart[] = []
-      if (trimmed !== '') parts.push({ type: 'text', text })
-      for (const image of images) parts.push(image.part)
-      const failure = await onSubmit(parts)
-      if (failure !== undefined) setError(failure)
-    } catch (thrown) {
-      setError(thrown instanceof Error ? thrown.message : String(thrown))
-    } finally {
-      setBusy(false)
-    }
-  }, [busy, images, onSubmit, text])
-
-  const destructive = droppedTurns !== 0
-  const sendLabel = droppedTurns !== undefined && droppedTurns > 0
-    ? t('dialog.sendDiscard', { count: droppedTurns })
-    : t('dialog.send')
-
-  return createPortal(
-    <div
-      ref={overlay}
-      className="dsh-redo-overlay"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) requestClose()
-      }}
-    >
-      <div
-        ref={dialog}
-        className="dsh-redo-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        onKeyDown={(event) => {
-          // IME: the Enter that commits a composition must never send, and
-          // Escape during composition must not throw the draft away.
-          if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
-          // Focus stays inside the dialog: the app behind it is inert, and a
-          // portaled dialog has no browser-level trap of its own.
-          if (event.key === 'Tab') {
-            const root = dialog.current
-            if (root === null) return
-            const focusable = focusableWithin(root)
-            const first = focusable[0]
-            const last = focusable[focusable.length - 1]
-            if (first === undefined || last === undefined) {
-              event.preventDefault()
-              return
-            }
-            const active = document.activeElement
-            if (active === null || !root.contains(active)) {
-              event.preventDefault()
-              first.focus()
-            } else if (event.shiftKey && active === first) {
-              event.preventDefault()
-              last.focus()
-            } else if (!event.shiftKey && active === last) {
-              event.preventDefault()
-              first.focus()
-            }
-            return
-          }
-          if (event.key === 'Escape') {
-            event.stopPropagation()
-            // Escape dismisses the discard prompt before it asks again.
-            if (discarding) {
-              setDiscarding(false)
-              return
-            }
-            requestClose()
-            return
-          }
-          if (event.key !== 'Enter' || event.shiftKey) return
-          // While the discard prompt is up, Enter must not send behind it.
-          if (discarding) return
-          // Only the textarea sends; on any other control Enter keeps its own
-          // meaning (activate the focused button).
-          if (event.target !== input.current) return
-          event.preventDefault()
-          void submit()
-        }}
-      >
-        <div className="dsh-redo-title" id={titleId}>{t('dialog.title')}</div>
-        <textarea
-          ref={input}
-          className="dsh-redo-input"
-          value={text}
-          rows={Math.min(12, Math.max(3, text.split('\n').length))}
-          spellCheck={false}
-          aria-label={t('dialog.textLabel')}
-          aria-describedby={hintId}
-          placeholder={t('dialog.placeholder')}
-          onChange={(event) => { setText(event.target.value) }}
-        />
-        {images.length === 0 ? null : (
-          <div className="dsh-redo-images">
-            {images.map(image => {
-              const previewUrl = image.previewUrl ?? previews[image.key]
-              return (
-                <span className="dsh-redo-image" key={image.key}>
-                  {previewUrl === undefined
-                    ? <span className="dsh-redo-image-placeholder" role="img" aria-label={t('dialog.image')} />
-                    : <img src={previewUrl} alt={t('dialog.image')} />}
-                  <button
-                    type="button"
-                    className="dsh-redo-image-remove"
-                    aria-label={t('dialog.removeImage')}
-                    title={t('dialog.removeImage')}
-                    onClick={() => { remove(image.key) }}
-                  >
-                    ×
-                  </button>
-                </span>
-              )
-            })}
-          </div>
-        )}
-        <div className="dsh-redo-row-actions">
-          <button
-            type="button"
-            className="dsh-redo-button dsh-redo-small"
-            disabled={busy || picking}
-            onClick={() => { fileInput.current?.click() }}
-          >
-            {t('dialog.addImage')}
-          </button>
-          <input
-            ref={fileInput}
-            type="file"
-            accept="image/png,image/jpeg,image/webp,image/gif"
-            multiple
-            hidden
-            onChange={(event) => { void add(event.target.files) }}
-          />
-          <span className="dsh-redo-hint" id={hintId}>{t('dialog.hint')}</span>
-        </div>
-        {destructive
-          ? (
-            <div className="dsh-redo-warning" role="note">
-              {droppedTurns === undefined ? t('dialog.warningUnknown') : t('dialog.warning', { count: droppedTurns })}
-            </div>
-          )
-          : null}
-        {discarding
-          ? (
-            <div className="dsh-redo-discard" role="alert">
-              <span className="dsh-redo-confirm-text">{t('dialog.discardText')}</span>
-              <button
-                type="button"
-                className="dsh-redo-button dsh-redo-small"
-                onClick={() => { setDiscarding(false) }}
-              >
-                {t('dialog.discardKeep')}
-              </button>
-              <button
-                type="button"
-                className="dsh-redo-button dsh-redo-small dsh-redo-danger"
-                onClick={onCancel}
-              >
-                {t('dialog.discardConfirm')}
-              </button>
-            </div>
-          )
-          : null}
-        {error === undefined ? null : <div className="dsh-redo-error" role="alert">{error}</div>}
-        {discarding
-          ? null
-          : (
-            <div className="dsh-redo-dialog-actions">
-              <button type="button" className="dsh-redo-button" onClick={requestClose} disabled={busy}>
-                {t('dialog.cancel')}
-              </button>
-              <button
-                type="button"
-                className={`dsh-redo-button ${destructive ? 'dsh-redo-danger' : 'dsh-redo-primary'}`}
-                onClick={() => { void submit() }}
-                disabled={busy || (text.trim() === '' && images.length === 0)}
-              >
-                {busy ? t('dialog.sending') : sendLabel}
-              </button>
-            </div>
-          )}
-      </div>
-    </div>,
-    document.body,
-  )
-}
-
-/** Elements the focus trap cycles through, in document order. */
-const FOCUSABLE = 'button:not(:disabled), textarea:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])'
-
-/**
- * Focusable descendants of one dialog, skipping visually hidden controls.
- * @param root - dialog element.
- * @returns tabbable elements in document order.
- */
-function focusableWithin(root: HTMLElement): HTMLElement[] {
-  return [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(element => element.offsetParent !== null)
-}
-
-/**
- * Stable identity for one image list, used to detect removed or added images.
- * @param images - current editor images.
- * @returns a joined key string.
- */
-function imagesFromKeys(images: readonly EditorImage[]): string {
-  return images.map(image => image.key).join('\u0000')
 }
 
 /** Plugin-owned stylesheet: the replaced row owns its own layout. */
@@ -1045,6 +731,7 @@ const CSS = `
   font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary);
 }
 .dsh-redo-confirm-text { min-width: 0; }
+.dsh-redo-confirm-note { display: block; color: var(--dsw-alias-label-tertiary); }
 @media (hover: hover) {
   [data-chat-flow-kind=user]:has(~ [data-chat-flow-kind=user]) .dsh-redo-row:not([data-superseded]) .dsh-redo-meta {
     opacity: 0; transition: opacity 80ms;
@@ -1054,55 +741,6 @@ const CSS = `
     opacity: 1;
   }
 }
-.dsh-redo-overlay {
-  position: fixed; inset: var(--dsh-frame-chrome-top, 0px) 0 0; z-index: 1200;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--dsw-alias-bg-mask-1); padding: 24px;
-}
-.dsh-redo-dialog {
-  width: min(680px, 100%); display: flex; flex-direction: column; gap: 10px; padding: 18px;
-  border-radius: var(--dsw-radius-panel); border: 1px solid var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary);
-  box-shadow: var(--dsw-elevation-prominent); font-family: var(--dsw-font-family);
-  animation: dsh-redo-enter var(--ds-transition-duration, .2s) var(--ds-ease-in-out, cubic-bezier(.4, 0, .2, 1));
-}
-@keyframes dsh-redo-enter {
-  from { opacity: 0; transform: translateY(6px) scale(.99); }
-  to { opacity: 1; transform: none; }
-}
-.dsh-redo-title { font-size: 14px; font-weight: 600; }
-.dsh-redo-input {
-  width: 100%; resize: vertical; min-height: 84px; padding: 10px 12px; box-sizing: border-box;
-  border-radius: var(--dsw-radius-md); border: 1px solid var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary);
-  font: inherit; font-size: 13px; line-height: 20px; outline: none;
-}
-.dsh-redo-input:focus { border-color: var(--dsw-alias-brand-primary); }
-.dsh-redo-images { display: flex; flex-wrap: wrap; gap: 12px; }
-.dsh-redo-image { position: relative; display: inline-flex; }
-.dsh-redo-image img, .dsh-redo-image-placeholder {
-  width: 64px; height: 64px; object-fit: contain; display: block;
-  background: var(--dsw-alias-bg-layer-1);
-  border-radius: var(--dsw-radius-md); border: 1px solid var(--dsw-alias-border-l2);
-}
-.dsh-redo-image-placeholder { background: var(--dsw-alias-bg-skeleton); }
-.dsh-redo-image-remove {
-  position: absolute; top: -8px; right: -8px; width: 24px; height: 24px; padding: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  border-radius: 50%; border: 1px solid var(--dsw-alias-border-l2); cursor: pointer;
-  background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary);
-  font-size: 14px; line-height: 1;
-}
-.dsh-redo-image-remove:hover { background: var(--dsw-alias-interactive-bg-hover); }
-.dsh-redo-row-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.dsh-redo-hint { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
-.dsh-redo-warning { font-size: 12px; line-height: 18px; color: var(--dsw-alias-state-warn-primary); }
-.dsh-redo-discard {
-  display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap;
-  font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary);
-}
-.dsh-redo-error { font-size: 12px; line-height: 18px; color: var(--dsw-alias-state-error-primary); }
-.dsh-redo-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .dsh-redo-button {
   height: 30px; padding: 0 14px; border-radius: var(--dsw-radius-md); cursor: pointer;
   border: 1px solid var(--dsw-alias-border-l2); background: transparent;
@@ -1111,11 +749,6 @@ const CSS = `
 .dsh-redo-button:hover:not(:disabled) { background: var(--dsw-alias-bg-layer-3); }
 .dsh-redo-button:disabled { opacity: .5; cursor: not-allowed; }
 .dsh-redo-small { height: 26px; padding: 0 10px; font-size: 12px; }
-.dsh-redo-primary {
-  border-color: transparent; background: var(--dsw-alias-button-primary-fill);
-  color: var(--dsw-alias-label-primary-inverted);
-}
-.dsh-redo-primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
 .dsh-redo-danger {
   border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent);
   background: var(--dsw-alias-interactive-bg-hover-danger);
@@ -1145,6 +778,30 @@ interface ClientSessionsFace {
  */
 function clientSessions(ctx: Context): ClientSessionsFace {
   return ctx.sessions as unknown as ClientSessionsFace
+}
+
+/**
+ * The draft-staging half of the Conversation service.
+ *
+ * `createDrafts` lives on the exported `ConversationController`, not on the
+ * `IConversation` face `ctx.conversation` publishes, so the narrow shape this
+ * plugin needs is named here instead of widening an upstream type.
+ */
+interface ConversationDraftsFace {
+  createDrafts(
+    sessionId: SessionId,
+    files: readonly File[],
+    uploadImages: boolean,
+  ): readonly { readonly id: DraftId }[]
+}
+
+/**
+ * Read that face off the root context.
+ * @param ctx - client root context.
+ * @returns the draft staging service.
+ */
+function conversationDrafts(ctx: Context): ConversationDraftsFace {
+  return ctx.conversation as unknown as ConversationDraftsFace
 }
 
 /**
@@ -1211,6 +868,39 @@ export function apply(ctx: Context): void {
         }
         return later
       },
+      arm: async (target, images) => {
+        if (isSupersededSeq(sessionId, target)) return { ok: false, code: 'superseded' }
+        const binding = clientSessions(ctx).binding(sessionId as SessionId)
+        if (binding === undefined) return { ok: false, code: 'not-open' }
+        const session = binding.session
+        // The row disables redo while generating; this guard covers a race with
+        // another client. An armed rewrite would land in the composer queue.
+        if (session.getSnapshot().running) return { ok: false, code: 'running' }
+        const armed = await session.command(`/redo ${String(target)}`)
+        if (!armed.ok) return { ok: false, code: 'rejected', message: armed.error.message }
+        if (!armed.value.matched) return { ok: false, code: 'command' }
+        // Stored images are read back as bytes and staged as ordinary composer
+        // drafts, so the send path stays the one the user knows. A failed read
+        // disarms again instead of leaving a rewrite that would drop images.
+        const files: File[] = []
+        for (const [index, image] of images.entries()) {
+          const stored = await session.readAttachment(image.attachmentId)
+          if (!stored.ok) {
+            await session.command('/redo off')
+            return { ok: false, code: 'attachment' }
+          }
+          files.push(new File(
+            [stored.value.data],
+            image.name ?? `redo-${String(target)}-${String(index)}.${extensionOf(image.mediaType)}`,
+            { type: image.mediaType },
+          ))
+        }
+        const drafts = files.length === 0
+          ? []
+          : conversationDrafts(ctx).createDrafts(sessionId as SessionId, files, true)
+        ARMED.set(sessionId, { target, at: Date.now() })
+        return { ok: true, draftIds: drafts.map(draft => draft.id) }
+      },
       resend: async (target, parts) => {
         if (isSupersededSeq(sessionId, target)) return { ok: false, code: 'superseded' }
         const binding = clientSessions(ctx).binding(sessionId as SessionId)
@@ -1221,18 +911,10 @@ export function apply(ctx: Context): void {
         // prompt sent mid-turn would surface in the composer queue.
         if (session.getSnapshot().running) return { ok: false, code: 'running' }
         // Stored images travel as bytes; the Host admits them into fresh durable
-        // refs. A picked image already carries its bytes. A file part cannot ride
-        // this path (it needs a receipt from a new upload).
+        // refs. A file part cannot ride this path (it needs a receipt from a new
+        // upload).
         const wire = await Promise.all(parts.map(async (part) => {
           if (part.type === 'text') return { type: 'text', text: part.text }
-          if ('data' in part) {
-            return {
-              type: 'image',
-              mediaType: part.mediaType,
-              data: part.data,
-              ...part.name === undefined ? {} : { name: part.name },
-            }
-          }
           const stored = await session.readAttachment(part.attachment.attachmentId)
           if (!stored.ok) return undefined
           return {
@@ -1245,7 +927,7 @@ export function apply(ctx: Context): void {
         if (wire.some(part => part === undefined)) return { ok: false, code: 'attachment' }
         // A fresh id per attempt: the Host de-duplicates a repeated rpcId, so a
         // second redo of the same message must not reuse the first one's.
-        const requestId = `redo:${target}:${uuid()}` as unknown as PromptRequestId
+        const requestId = `redo:${String(target)}:${uuid()}` as unknown as PromptRequestId
         const result = await session.prompt(wire as unknown as PromptParts, 'queue', undefined, requestId)
         return result.ok ? { ok: true } : { ok: false, code: 'rejected', message: result.error.message }
       },

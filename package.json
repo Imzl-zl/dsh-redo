@@ -1,6 +1,6 @@
 {
   "name": "dsh-redo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Edit or retry an already-sent user message and regenerate in place: rewinds the model context to that message without leaving the session",
   "type": "module",
   "main": "lib/index.js",
@@ -56,7 +56,9 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test": "node --test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
@@ -68,11 +70,11 @@
     "@deepseek-ai/dsh-client-ui-conversation": "0.2.1-rc.2",
     "@deepseek-ai/dsh-client-ui-renderer": "0.2.1-rc.2",
     "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-commands": "0.2.1-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
     "@deepseek-ai/dsh-session": "0.2.1-rc.2",
     "@types/node": "^24.0.0",
     "@types/react": "^18.3.0",
-    "@types/react-dom": "^18.3.7",
     "esbuild": "^0.25.0",
     "typescript": "^5.9.0"
   }

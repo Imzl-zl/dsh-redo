@@ -51,6 +51,16 @@ DSH（DeepSeek Harness）是一个 append-only 的会话系统：消息一旦发
 
 需要 DSH `>= 0.2.0-rc.1 < 0.3.0`，并在 Web GUI 中使用。
 
+从 npm 装（发布物已含构建好的 `lib/`，无需自己 build）：
+
+```sh
+dsh plugin --profile <profile> add dsh-redo
+dsh --profile <profile> --dump-config | grep redo   # 应看到 "== dsh-redo" 层
+dsh --profile <profile>
+```
+
+或者从源码装（改代码、跟进未发布提交时用）：
+
 ```sh
 git clone https://github.com/Imzl-zl/dsh-redo.git
 cd dsh-redo
@@ -58,8 +68,6 @@ npm install
 npm run build
 
 dsh plugin --profile <profile> add <本仓库绝对路径>
-dsh --profile <profile> --dump-config | grep redo   # 应看到 "== dsh-redo" 层
-dsh --profile <profile>
 ```
 
 装完重启 GUI。想先拿独立 profile 试，可以用：

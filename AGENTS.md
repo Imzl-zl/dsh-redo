@@ -8,6 +8,10 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
 - **运行中的 DSH**：打包版 `D:\soft\DeepSeek Harness\resources\app.asar\dsh\`；Web GUI 端口每次启动都会变，
   以运行时给的 URL 为准，不要把端口写死。
 - 本仓库是**外挂插件**，不改上游源码；上游只读引用。
+- **已发布 npm**：`dsh-redo`（scoped 无，账号 `imzl`，`latest` = 0.2.0）。发布用 `npm publish`；
+  npm 现在是**暂存发布**流程：新包名先落 `0.0.0-stage` 占位、真版本进审核，几分钟后自动成为 `latest`。
+  新包首发前的 2FA 需要网页端完成（CLI 的 EOTP 链接会被 npm 打码）；临时 granular token 走
+  `--//registry.npmjs.org/:_authToken=...` 传入，用完**立刻在网页删掉**。
 - **测试渠道**：`redo-test` profile 固定走本地 Cherry 免费网关（`http://127.0.0.1:23333/v1`，
   模型 `8497f00c-73d9-4f57-8634-78cb69e0f81a:auto`，key 用凭据里的 `CHERRY_API_KEY`）；测试不要走官方渠道。
 - 结论与接入点调研见 [docs/research/2026-10-24-edit-resend-seams.md](docs/research/2026-10-24-edit-resend-seams.md)。

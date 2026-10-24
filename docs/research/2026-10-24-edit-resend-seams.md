@@ -167,3 +167,26 @@
 
 先按**路线 B** 做主路径（真正的原地编辑重发），**路线 A** 作为兜底/降级（宿主半未加载时按钮改为"分叉并预填"）。
 不建议为这个功能去改上游源码：产品注记已经把座位留好了，缺的只是这个插件。
+
+## 7. 补记（2026-10-24 晚）：路线 B 落地后又加了一条「命令武装」
+
+路线 B 的编辑入口原来是一个插件自己的模态弹窗。想让它变成 Codex 那种「内容回到输入框」时，撞上两条硬事实：
+
+1. composer 提交时的 `requestId` 由 `Session.beginSubmission` 内部 `randomUUID()` 铸
+   （`packages/api/session-controller/src/client/sessions/session.ts:229`），`BeginSubmissionInput` 没有
+   requestId 字段，prompt 复用的就是这个 id —— 提交那一刻没有钩子能把 id 换成 `redo:`。
+2. `CommandResult` 只有 `success` / `error`（`packages/interaction/commands/src/types.ts:34`），
+   命令处理器不能替用户发 prompt。
+
+同时确认了两条排除项：
+
+- `agent/pre-step` 允许返回 `{kind:'enter', messages}` 替换认领到的消息（`packages/core/agent-loop/src/agent.ts:289`），
+  理论上可以改写 `source.rpcId` 给 composer 的发送盖上 `redo:`——但提交回显
+  `pendingSubmissions` 是按 requestId 关联退休的，换掉 id 就留下永不退休的幽灵气泡，**不做**。
+- 零宽标记：插件在 composer 序列化路径上没有挂点，标记会原样进 provider，**不做**。
+
+最终采用 **`ctx.commands` 武装**：客户端点「编辑重发」→ `session.command('/redo <seq>')` 让宿主记一个
+latch（绑 agent、只被下一条人类消息消费、5 分钟 TTL、`/redo off` 撤销、显式 `redo:` 优先）→ 再
+`setDraft` + `createDrafts`/`addAttachments` 回填 composer → 用户正常发送，宿主在 `agent/pre-step` 消费 latch。
+纯公开扩展点，不需要 RPC，不改上游。代价是时间线留一条命令记录，且 composer 路径的变暗区间靠客户端
+「武装后第一条更新的用户消息」补登（刷新后丢失，视觉层面）。

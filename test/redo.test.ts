@@ -3,25 +3,29 @@
  *
  * Two entry points, two different obligations:
  *
- * - `/redo <seq>` **retracts now**. The click happens between Turns, so the
- *   command opens a Turn, writes the replacement inside its only Step, and closes
- *   both. A `system/message` appended outside an open turn+step makes the next
- *   JSONL read reject the log, so the coordinates are as load-bearing here as in
- *   the retry path.
+ * - `/redo <seq>` **retracts now**. Turn boundaries are not this plugin's to
+ *   invent: it reads the host's `turnBoundary` fold, writes a Turn only between
+ *   Turns and only with the number that follows the last one, and refuses the
+ *   click while a Turn is still open. A `system/message` outside an open
+ *   turn+step, a second `turn/start` inside one, or an off-by-one Turn number
+ *   each make the next JSONL read reject the log, so this file locks all three.
  * - A `redo:<seq>:<uuid>` prompt **retries**, and the replacement must land in
  *   the step that claimed it — `agent/pre-step` records the plan, `agent/request`
  *   consumes it exactly once.
  *
- * Each test states one of those invariants against a fake session, so a refactor
- * that quietly widens, narrows, or re-scopes an append goes red without a browser.
  * The hooks are exercised through `apply(ctx)` — the same path the host uses —
- * rather than through an exported helper.
+ * rather than through an exported helper. The last test reads what the plugin
+ * wrote back with the release V4 validator, which is the code that answers a GUI
+ * history load, so "the plugin writes a log the host still accepts" is asserted
+ * against the host, not against this plugin's own idea of correctness.
  */
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import type { Context } from '@deepseek-ai/cordis'
+import type { TurnBoundaryProjection } from '@deepseek-ai/dsh-agent'
+import { assertReleasedV4Relationships } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 
 import { apply } from '../src/index.ts'
 
@@ -49,7 +53,11 @@ interface RecordedAppend {
     }
   }
   readonly options?: {
-    readonly surfaceOp: { readonly op: string; readonly startSeq: number; readonly endSeq: number }
+    readonly surfaceOp: {
+      readonly op: string
+      readonly startSeq: number
+      readonly endSeq: number
+    }
     readonly sourceEventSeqs: readonly number[]
   }
 }
@@ -92,8 +100,19 @@ interface FakeCommands {
 interface FakeCtx {
   readonly handlers: Map<string, Handler[]>
   readonly commands: FakeCommands
+  readonly sessionProjections: {
+    stateOf(session: unknown, key: string): unknown
+  }
   on(event: string, handler: Handler): () => void
   effect(factory: () => (() => void) | void, label?: string): void
+}
+
+/** A session whose last Turn already closed: the only moment a retraction may write. */
+const BETWEEN_TURNS: TurnBoundaryProjection = {
+  openTurnStartSeq: null,
+  lastStepStartSeq: null,
+  lastStepBoundary: null,
+  lastTurn: 0,
 }
 
 /** Build a session whose surface is `nodes`, appends recorded in order. */
@@ -115,7 +134,7 @@ function fakeSession(
   }
 }
 
-function fakeCtx(): FakeCtx {
+function fakeCtx(boundary: TurnBoundaryProjection): FakeCtx {
   const handlers = new Map<string, Handler[]>()
   const registered = new Map<string, FakeCommand>()
   return {
@@ -126,6 +145,9 @@ function fakeCtx(): FakeCtx {
         registered.set(command.name, command)
         return () => { registered.delete(command.name) }
       },
+    },
+    sessionProjections: {
+      stateOf(_session, key) { return key === 'turnBoundary' ? boundary : undefined },
     },
     on(event, handler) {
       const list = handlers.get(event) ?? []
@@ -141,9 +163,10 @@ function fakeCtx(): FakeCtx {
 function harness(
   nodes: readonly number[],
   events: ReadonlyMap<number, unknown>,
+  boundary: TurnBoundaryProjection = BETWEEN_TURNS,
   log: readonly LoggedEvent[] = [],
 ) {
-  const ctx = fakeCtx()
+  const ctx = fakeCtx(boundary)
   const session = fakeSession(nodes, events, log)
   const agent: FakeAgent = { session }
   // The plugin registers hooks, effects, and one command, and only reads
@@ -197,10 +220,10 @@ function onlyMessageAppend(session: FakeSession): RecordedAppend {
 test('the command retracts immediately inside a Turn it opens and closes', () => {
   const nodes = [1, 4, 12, 20, 33]
   const target = 12
-  const { ctx, agent, session } = harness(nodes, new Map([[target, USER_EVENT]]), [
-    { type: 'turn/start', data: { turn: 6 } },
-    { type: 'turn/end', data: { turn: 6 } },
-  ])
+  const { ctx, agent, session } = harness(nodes, new Map([[target, USER_EVENT]]), {
+    ...BETWEEN_TURNS,
+    lastTurn: 6,
+  })
 
   assert.deepEqual(runCommand(ctx, agent, ` ${String(target)}`), { kind: 'success' })
 
@@ -210,7 +233,7 @@ test('the command retracts immediately inside a Turn it opens and closes', () =>
   ])
 
   const [turnStart, stepStart, message, stepEnd, turnEnd] = session.appends
-  // The Turn follows the log, not the wall clock: the loop opens 8 next.
+  // The Turn follows the host's fold, not a scan of the log: the loop opens 8 next.
   assert.deepEqual(turnStart?.data, { turn: 7 })
   assert.deepEqual(stepStart?.data, { turn: 7, step: 1 })
   assert.deepEqual(message?.data.turn, 7)
@@ -226,6 +249,41 @@ test('the command retracts immediately inside a Turn it opens and closes', () =>
   })
   // Constraint: `sourceEventSeqs` covers every shadowed surface node, no more.
   assert.deepEqual([...(message?.options?.sourceEventSeqs ?? [])], shadowed)
+})
+
+test('a click inside an open Turn is refused and leaves the log untouched', () => {
+  const { ctx, agent, session } = harness([1, 9], new Map([[9, USER_EVENT]]), {
+    ...BETWEEN_TURNS,
+    // The loop is still writing inside Turn 2: a second `turn/start` here is the
+    // one event a cold read answers with "does not open the expected turn".
+    openTurnStartSeq: 4 as never,
+    lastTurn: 2,
+  })
+
+  const result = runCommand(ctx, agent, '9') as { kind: string, text?: string }
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text ?? '', /still generating/)
+  assert.equal(session.appends.length, 0, 'a refused retraction must not touch the log')
+})
+
+test('a host without the turnBoundary fold is an error, not a guess', () => {
+  const ctx = fakeCtx(BETWEEN_TURNS)
+  const session = fakeSession([1, 9], new Map([[9, USER_EVENT]]), [])
+  // A composition that never registered the fold cannot tell between Turns.
+  const blind = {
+    ...ctx,
+    sessionProjections: { stateOf: () => undefined },
+  }
+  apply(blind as unknown as Context)
+
+  const command = blind.commands.registered.get('redo')
+  assert.ok(command !== undefined)
+  assert.throws(
+    () => command.handler({ agent: { session }, rawInput: '9', commandId: 'test', attachments: [], signal: new AbortController().signal }),
+    /no turnBoundary projection/,
+  )
+  assert.equal(session.appends.length, 0)
 })
 
 test('the replacement is an empty system node and never a user message', () => {
@@ -377,7 +435,7 @@ test('a target that left the active context is refused', async () => {
 
   await assert.rejects(
     emit(ctx, 'agent/request', { agent, turn: 3, step: 1 }),
-    /no longer part of the active context/,
+    /no longer part of the conversation context/,
   )
 })
 
@@ -389,7 +447,7 @@ test('the protected session head cannot be rewound', async () => {
 
   await assert.rejects(
     emit(ctx, 'agent/request', { agent, turn: 3, step: 1 }),
-    /protected session head/,
+    /first message of a session cannot be rewritten/,
   )
 })
 
@@ -401,7 +459,7 @@ test('a node that is not a human user message cannot be rewound', async () => {
 
   await assert.rejects(
     emit(ctx, 'agent/request', { agent, turn: 3, step: 1 }),
-    /not a human user message/,
+    /only a message you sent can be rewritten/,
   )
 })
 
@@ -413,4 +471,126 @@ test('a disposed agent drops its pending retry', async () => {
   await emit(ctx, 'agent/request', { agent, turn: 3, step: 1 })
 
   assert.equal(session.appends.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// The host's own reader over what the plugin wrote
+// ---------------------------------------------------------------------------
+
+/** One surface event of the synthetic stored log. */
+interface StoredEvent {
+  readonly seq: number
+  readonly time: number
+  readonly type: string
+  readonly data: unknown
+  readonly surfaceOp?: string | { readonly op: string, readonly startSeq: number, readonly endSeq: number }
+  readonly sourceEventSeqs?: readonly number[]
+}
+
+/** The event types this fixture uses; the reader interprets every one of them. */
+const KNOWN_TYPES = new Set([
+  'turn/start', 'turn/end', 'step/start', 'step/end',
+  'system/message', 'user/message', 'assistant/message',
+])
+
+/** The stored header the reader needs; identity matters only for delivery events. */
+const HEADER = { id: 'session-redo-test', version: 4, createdAt: 1, cwd: 'D:\\test' }
+
+/**
+ * A synthetic stored V4 log the release reader accepts, plus the views the
+ * plugin reads off it: surface nodes, event lookup, and the turn boundary fold.
+ * @param openTurn - whether generation is in flight at the end of the log.
+ */
+function storedLog(openTurn: boolean): {
+  events: StoredEvent[]
+  surface: readonly number[]
+  boundary: TurnBoundaryProjection
+} {
+  const events: StoredEvent[] = []
+  const push = (type: string, data: unknown, extra: Omit<Partial<StoredEvent>, 'seq'> = {}): void => {
+    events.push({ seq: events.length, time: 1, type, data, ...extra })
+  }
+  push('turn/start', { turn: 1 })
+  push('step/start', { turn: 1, step: 1 })
+  push('system/message', {
+    turn: 1,
+    step: 1,
+    message: { id: 'head', role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'system' }] },
+  }, { surfaceOp: 'append' })
+  push('user/message', {
+    turn: 1,
+    step: 1,
+    role: 'user',
+    content: [{ type: 'text', text: 'first' }],
+    source: { kind: 'user', rpcId: '11111111-1111-4111-8111-111111111111' },
+  }, { surfaceOp: 'append' })
+  push('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: { role: 'assistant', source: { kind: 'assistant' }, content: [{ type: 'text', text: 'answer' }] },
+  }, { surfaceOp: 'append' })
+  push('step/end', { turn: 1, step: 1 })
+  push('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  if (openTurn) push('turn/start', { turn: 2 })
+
+  return {
+    events,
+    surface: [2, 3, 4],
+    boundary: {
+      openTurnStartSeq: openTurn ? (events.length - 1) as never : null,
+      lastStepStartSeq: null,
+      lastStepBoundary: null,
+      lastTurn: openTurn ? 2 : 1,
+    },
+  }
+}
+
+/**
+ * Replay the plugin's appends into a real event envelope, which is what the
+ * persistence layer would have written.
+ * @param stored - events the log already held.
+ * @param appends - what the plugin asked the session to append.
+ * @returns the log a cold read would see.
+ */
+function materialize(stored: readonly StoredEvent[], appends: readonly RecordedAppend[]): StoredEvent[] {
+  const events = [...stored]
+  for (const append of appends) {
+    events.push({
+      seq: events.length,
+      time: 1,
+      type: append.type,
+      data: append.data,
+      ...(append.options === undefined ? {} : {
+        surfaceOp: append.options.surfaceOp,
+        sourceEventSeqs: append.options.sourceEventSeqs,
+      }),
+    })
+  }
+  return events
+}
+
+test('a retraction between Turns leaves a log the release validator accepts', () => {
+  const stored = storedLog(false)
+  const { ctx, agent, session } = harness(stored.surface, new Map(stored.events.map(event => [event.seq, event])), stored.boundary)
+
+  assert.deepEqual(runCommand(ctx, agent, '3'), { kind: 'success' })
+
+  const readBack = materialize(stored.events, session.appends)
+  assert.doesNotThrow(
+    () => { assertReleasedV4Relationships({ header: HEADER, events: readBack, inheritedEventCount: 0 } as never, KNOWN_TYPES) },
+    'the host refused the log the plugin wrote',
+  )
+})
+
+test('the retraction an open Turn would have corrupted is never written', () => {
+  const stored = storedLog(true)
+  const { ctx, agent, session } = harness(stored.surface, new Map(stored.events.map(event => [event.seq, event])), stored.boundary)
+
+  assert.equal((runCommand(ctx, agent, '3') as { kind: string }).kind, 'error')
+  assert.equal(session.appends.length, 0)
+
+  // The stored log still reads: the session keeps its history and its Turn.
+  assert.doesNotThrow(
+    () => { assertReleasedV4Relationships({ header: HEADER, events: stored.events, inheritedEventCount: 0 } as never, KNOWN_TYPES) },
+  )
 })

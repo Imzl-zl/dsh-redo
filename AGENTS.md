@@ -25,6 +25,11 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
 4. surface 节点 0 若是 `system/message` 则受保护，只能由 `system/message` 单节点改写。
 5. **不存在"无输入的 turn"**：loop 只有 claiming 到非空消息才会发起模型请求；空消息批次直接结束 turn 且不调模型。
 6. 原生没有"编辑已发送消息"的 RPC；`updateQueue(edit)` 只作用于**未发送**的队列项，`sessions.fork({atSeq})` 是唯一公开的"回到过去"能力。
+7. **turn 边界归宿主**：`turn/start` 只能在**没有未关闭 turn** 时开，且编号必须等于"已关闭 turn 数 + 1"，否则冷读报
+   `SessionFormatError: turn/start does not open the expected turn`。唯一事实来源是 `ctx.sessionProjections.stateOf(
+   session,'turnBoundary')` 的 `openTurnStartSeq` / `lastTurn`（loop 与 reader 用的是同一个折叠）；
+   **不要**扫 `snapshotEvents()` 自己算最大 turn 号。有未关闭 turn 时必须**拒绝**撤回——客户端 `running` 门禁只是 UX，
+   同一会话被两个窗口打开时它根本不成立，host 必须自己挡。
 
 ## 插件协议（已实现并实测）
 
@@ -41,8 +46,9 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
 - requestId 里的目标必须按**纯数字**解析（`/^(\d+):/`）。用 `Number()` 会把 `redo::uuid` 读成目标 `0`、
   `0x10` 读成 `16`——畸形 id 于是去改写受保护的头节点，从"无操作"变成宿主抛错。`test/redo.test.ts` 锁着这一条。
 - 为什么命令必须自己开 turn：`system/message` 只能落在已打开的 turn+step 内，点击发生在 turn 之外。
-  手写这五个事件的合法性靠顺序与坐标，`Session.append('turn/start')` 本身是公开的，loop 的 turn 号从日志投影，
-  实测重启冷读无 `SessionPersistenceCorruptionError`，随后的普通发送正常开下一个 turn。
+  `Session.append('turn/start')` 本身是公开的，写盘前不校验 turn 生命周期，所以**合法性只能由插件自己守**：
+  撤回只在 `boundary.openTurnStartSeq === null` 时执行，编号取 `boundary.lastTurn + 1`（约束 7），
+  关掉 turn/end 后 loop 的下一个 turn 自然取下一个号。`turnBoundary` 投影缺失时直接报错，不猜编号。
 
 ## 编辑为什么是「消息上的点击 + 输入框里的发送」
 
@@ -90,7 +96,9 @@ npm install
 npm test            # node --test：宿主半不变式，直接跑 TS 源码，不需要构建
 npm run build       # lib/index.js + lib/client.js
 npm run typecheck
-node scripts/dump-session.mjs <session.v4.jsonl.zstd>   # 解码会话日志
+node scripts/dump-session.mjs <session.v4.jsonl.zstd>            # 解码会话日志
+node scripts/check-sessions.mjs <会话目录或文件>                  # 用上游 V4 校验器逐份冷读，报第一处坏事件
+node scripts/verify-retract-safe.ts <session.v4.jsonl.zstd>      # 在这份真实日志上试一次撤回：关着的 turn 能写且可读，开着就拒绝
 ```
 
 上游源码仍**未安装依赖**；需要跑上游测试时才 `pnpm install`。
@@ -112,13 +120,17 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 
 ## 已验证
 
-**自动化**：`npm test`（24 项）。
-`test/redo.test.ts`（18 项）管宿主半——撤回命令写出的五个事件顺序与坐标（turn/step 精确、turn 号跟着日志走、
-不留 open step）、`sourceEventSeqs` 全覆盖被遮蔽的 surface 尾、节点 0 拒改、替换是空 system 而非 user、
-非法参数/越界目标/非人类消息全被拒且不碰日志；重试路线覆盖 plan 只消费一次、step 作用域、畸形 requestId 不重写。
+**自动化**：`npm test`（28 项）。
+`test/redo.test.ts`（22 项）管宿主半——撤回命令写出的五个事件顺序与坐标（turn/step 精确、turn 号取自
+`turnBoundary` 的 `lastTurn + 1`、不留 open step）、`sourceEventSeqs` 全覆盖被遮蔽的 surface 尾、节点 0 拒改、
+替换是空 system 而非 user、非法参数/越界目标/非人类消息全被拒且不碰日志；**未关闭 turn 时撤回被拒且一个事件都不写**，
+`turnBoundary` 缺失时直接报错而不是猜编号；最后两项把插件写出的日志交给上游 `assertReleasedV4Relationships`
+冷读——「关着的 turn 写出来必须可读」「开着的 turn 不许写」由宿主判定，不由插件自证。
+重试路线覆盖 plan 只消费一次、step 作用域、畸形 requestId 不重写。
 `test/intervals.test.ts`（6 项）管客户端推导——闭区间、重叠区间逐条保留、append 与畸形 marker 不算替换、
 只凭日志重建同一结果，以及「只有 replace 没有 user 的 turn」被认成撤回 turn。
-改 `src/index.ts` 前先跑它。变异检验两次（收窄 `endSeq` / 少一个 `sourceEventSeqs` 节点 / 去掉 TTL 判断）都能立刻变红。
+改 `src/index.ts` 前先跑它。变异检验都能立刻变红，最近一轮：收窄 `endSeq` / 少一个 `sourceEventSeqs` 节点 /
+去掉 TTL 判断 / **去掉未关闭 turn 的门禁**（红 2 项）/ **turn 号写成 `lastTurn + 2`**（红 3 项，含上游校验器那项）。
 
 **手工（packaged 0.2.1-rc.2 GUI + `redo-test` profile + 本地 Cherry 网关）**：
 

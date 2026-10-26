@@ -40,6 +40,8 @@ DSH（DeepSeek Harness）是一个 append-only 的会话系统：消息一旦发
 - **破坏性操作有确认**：撤回中段消息前会提示「之后的 N 轮对话会离开上下文」；输入框里本来有内容时再问一句是否替换。
 - **不会误触发**：撤回只影响你点的那条消息及其之后；其余会话、其余窗口不受影响。
 - **生成中禁用**：回答还在生成时两个按钮置灰，先停止再重发——不会把重发塞进输入框的排队区。
+  宿主端也照样挡：turn 还开着时 `/redo` 直接拒绝、一个事件都不写，所以即便按钮没来得及置灰（另一窗口正在
+  跑同一个会话），也不会把日志写成下次读不出来的样子。
 
 ### 不支持
 
@@ -109,7 +111,7 @@ dsh --profile redo-test --no-open --port 3111
 1. **撤回（编辑）**：客户端调 `/redo <seq>`（`ctx.commands.register` 注册的宿主命令），命令**当场**写五个事件
    ——`turn/start` → `step/start` → 空 content 的 `system/message`（`surfaceOp: replace target..surface 尾`）
    → `step/end` → `turn/end`。没有消息进 inbox，这个 turn 不会被请求模型；日志坐标精确，冷读不会报错。
-   点一下，消息就从上下文里消失了。
+   点一下，消息就从上下文里消失了。已有 turn 还开着时命令**拒绝执行**（一个事件都不写），见下一条。
 2. **重新生成**：客户端发送的 prompt 把目标写进 `requestId`（`redo:<seq>:<uuid>`），`agent/pre-step`
    从认领到的消息上读回来，`agent/request` 在**已经打开的 step** 里写同样的替换。
 
@@ -117,6 +119,11 @@ dsh --profile redo-test --no-open --port 3111
 `BeginSubmissionInput` 不接受外部注入，所以没有钩子能在提交那一刻插手。命令是客户端唯一能主动让宿主「现在就把这段删掉」的公开通道。
 
 为什么命令要自己开一个 turn：`system/message` 只能落在已打开的 turn+step 内，而点击发生在 turn 之外。
+
+turn 边界由宿主说了算：命令不扫日志、不自己算 turn 号，而是读 `ctx.sessionProjections.stateOf(session,'turnBoundary')`
+——和 agent loop、日志读取器同一个折叠。没有打开的 turn 才写，编号取 `lastTurn + 1`；有打开的 turn 就拒绝。
+写盘前宿主不校验 turn 生命周期，所以这条不变式只能插件自己守，否则下一次加载历史会整份拒读
+（`turn/start does not open the expected turn`）。
 
 为什么必须是空 `system/message`：它是唯一同时满足「不产生模型消息」和「Chat 时间线不渲染」的节点类型；
 空 `user/message` 会被 `deriveEventMessage` 原样投影给 provider，空 `developer/message` 会多一行空上下文。
@@ -141,20 +148,27 @@ dsh --profile redo-test --no-open --port 3111
 
 | 项目 | 说明 |
 | --- | --- |
-| DSH | `>= 0.2.0-rc.1 < 0.3.0`，实测 `0.2.1-rc.2` |
+| DSH | `>= 0.2.0-rc.1 < 0.3.0`，实测 `0.2.1-rc.2` / `0.2.1-rc.3` |
 | 平台 | Web GUI（浏览器半只要求 shell 模块表里的 `react`） |
 | 扩展点 | keyed slot `conversation.chat.node`、`agent/pre-step`、`agent/request`、`ctx.commands` |
 | 测试 | Node 24（`node --test` 直接跑 TypeScript 源码，不走构建） |
 
 ## 已验证
 
-**自动化**（`npm test`，24 项，跑在 `src/` 上，不需要构建）：宿主半锁「撤回命令写出的五个事件」顺序与坐标
-（turn/step 精确、turn 号跟着日志走、不留 open step）、`sourceEventSeqs` 完整覆盖被遮蔽的 surface 尾、
-受保护的节点 0 拒绝改写、替换必须是空 system 而非 user、非法参数/越界目标/非人类消息全被拒且不碰日志；
-重试路线覆盖 plan 只消费一次、step 作用域、畸形 requestId 不重写。客户端半锁区间推导与「撤回 turn」识别。
-CI 依次跑 `typecheck` → `test` → `build`。
+**自动化**（`npm test`，28 项，跑在 `src/` 上，不需要构建）：宿主半锁「撤回命令写出的五个事件」顺序与坐标
+（turn/step 精确、turn 号取 `turnBoundary` 的 `lastTurn + 1`、不留 open step）、`sourceEventSeqs` 完整覆盖
+被遮蔽的 surface 尾、受保护的节点 0 拒绝改写、替换必须是空 system 而非 user、非法参数/越界目标/非人类消息
+全被拒且不碰日志；turn 还开着时撤回被拒且不写任何事件；`turnBoundary` 缺失时报错而不是猜编号。
+最后两项把插件写出的日志交给上游 `assertReleasedV4Relationships` 冷读——「关着的 turn 写出来必须可读」
+「开着的 turn 不许写」由宿主判定，不由插件自证。重试路线覆盖 plan 只消费一次、step 作用域、畸形 requestId
+不重写。客户端半锁区间推导与「撤回 turn」识别。CI 依次跑 `typecheck` → `test` → `build`。
 
-变异检验过两次：把 `endSeq` 收窄 / 让 `sourceEventSeqs` 少一个节点、以及去掉过期判断（旧版）都会立刻有测试变红。
+变异检验：收窄 `endSeq` / 让 `sourceEventSeqs` 少一个节点 / 去掉未关闭 turn 的门禁 / turn 号写成
+`lastTurn + 2`，每一种都会立刻有测试变红（前两类 1 项，后两类 2–3 项，含上游校验器那项）。
+
+诊断脚本：`node scripts/check-sessions.mjs <目录或日志>` 用上游校验器逐份冷读并指出第一处坏事件；
+`node scripts/verify-retract-safe.ts <日志>` 在一份真实日志上试一次撤回（关着的 turn 必须写出可读日志，
+开着的 turn 必须一个事件都不写）。
 
 **手工**（packaged `0.2.1-rc.2` GUI，`redo-test` profile + 本地 Cherry 网关）：
 

@@ -7,6 +7,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This plugin talks to a host that has no compatibility shims, so the DSH version each release was
 built against is recorded alongside it.
 
+## [0.3.1] - 2026-10-26
+
+Built against DSH `0.2.1-rc.3`.
+
+### Fixed
+
+- **A retraction clicked while a Turn was still open no longer writes an unreadable log.** `/redo`
+  used to open its Turn with `max(turn) + 1` and never asked whether a Turn was already open, so a
+  click that raced generation (a second window on the same Session, a lagging `running` flag in the
+  client) appended a second `turn/start` inside the open Turn. The host writes that blindly, and the
+  next history load then refused the whole Session with
+  `SessionFormatError: turn/start does not open the expected turn` — permanently, because the log is
+  append-only. The command now reads the host's own `turnBoundary` projection: no open Turn and the
+  number after the last one, or a refusal that writes nothing.
+- Turn numbers are no longer derived by scanning the log for the highest one. The `turnBoundary` fold
+  is the same source the loop and the log reader use, so the Turn this plugin opens can no longer
+  disagree with the one the loop opens next. A host that does not expose that projection is an error,
+  not a guess.
+
+### Added
+
+- `scripts/check-sessions.mjs` reads stored sessions with the release V4 validator and names the first
+  event a history load would refuse; `scripts/verify-retract-safe.ts` runs one real `/redo` click
+  against a real stored log — between Turns it must write a readable log, inside an open Turn it must
+  write nothing.
+
 ## [0.3.0] - 2026-10-24
 
 Built against DSH `0.2.1-rc.2`.
@@ -103,7 +129,8 @@ Initial release.
   empty `system/message` as the replacement so it never projects to a model message.
 - Inline confirmation before a mid-conversation rewrite, with the number of turns it drops.
 
-[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.1.0...v0.2.0

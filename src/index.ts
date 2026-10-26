@@ -18,23 +18,28 @@
  * shadows the old message and everything the turns after it produced, and the
  * replacement node itself projects to no model message.
  *
- * Why the command opens its own Turn: a `system/message` may only be appended
- * inside an open turn+step with exact coordinates, or a later JSONL read rejects
- * the log as corrupt. A click happens between Turns, so the command opens one
- * that carries nothing but the replacement. No Step is requested, so no model
- * call happens.
+ * Turn boundaries belong to the host, and this plugin reads them from the very
+ * fold the loop and the log reader use (`turnBoundary`): a `turn/start` opens a
+ * Turn only in a closed log, and only with the number that follows the last one.
+ * So a retraction is offered **between** Turns and refused inside one, and the
+ * Turn it opens is numbered by that same projection rather than by a scan of the
+ * log — the loop's next Turn then takes the number after this one, which is the
+ * only way a later cold read can still accept the log.
  *
  * @module dsh-redo
  */
 
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, TurnBoundaryProjection } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import type { SessionSeq } from '@deepseek-ai/dsh-session'
+// Service-and-map augmentation only: `ctx.sessionProjections` and the
+// `turnBoundary` entry this plugin reads are declared there, not here.
+import type {} from '@deepseek-ai/dsh-session-projection'
 
 export const name = 'redo'
-export const inject = ['agents', 'commands']
+export const inject = ['agents', 'commands', 'sessionProjections']
 
 /** Prefix the client writes into the prompt request id of a retry. */
 const REDO_PREFIX = 'redo:'
@@ -60,21 +65,29 @@ interface RedoPlan {
   readonly target: number
 }
 
-/** Why a target cannot be rewound. */
-type TargetRefusal = 'missing' | 'head' | 'not-user'
+/**
+ * Why a retraction cannot be written right now.
+ *
+ * `busy` is not a client-visible nicety: a Turn that is still open owns the
+ * Step the loop is writing into, and opening another Turn behind it is the one
+ * thing a cold read refuses (`turn/start does not open the expected turn`).
+ */
+type Refusal = 'missing' | 'head' | 'not-user' | 'busy'
 
-/** Host-facing text for one refusal, thrown into the turn. */
-const REFUSAL_THROWN: Record<TargetRefusal, string> = {
-  missing: 'is no longer part of the active context',
-  head: 'is the protected session head',
-  'not-user': 'is not a human user message',
-}
-
-/** Human-facing text for one refusal, returned as the command result. */
-const REFUSAL_SHOWN: Record<TargetRefusal, string> = {
+/** Host-facing text for one refusal, shared by both entry points. */
+const REFUSAL: Record<Refusal, string> = {
   missing: 'that message is no longer part of the conversation context',
   head: 'the first message of a session cannot be rewritten',
   'not-user': 'only a message you sent can be rewritten',
+  busy: 'the session is still generating; retract once the turn has ended',
+}
+
+/** Everything one retraction writes, read in a single pass. */
+interface Retraction {
+  /** Turn the retraction opens: the host's next turn number. */
+  readonly turn: number
+  /** Surface nodes the replacement shadows: the target through the current tail. */
+  readonly shadowed: SessionSeq[]
 }
 
 /**
@@ -94,12 +107,12 @@ function redoTarget(source: unknown): number | undefined {
 }
 
 /**
- * Whether `target` can be rewritten right now.
+ * Whether `target` is a message this plugin may rewrite at all.
  * @param agent - agent whose session surface is inspected.
  * @param target - session seq the human asked to redo.
- * @returns the refusal, or undefined when the rewind is legal.
+ * @returns the refusal, or undefined when the target itself is rewritable.
  */
-function refusalOf(agent: Agent, target: number): TargetRefusal | undefined {
+function targetRefusal(agent: Agent, target: number): Refusal | undefined {
   const session = agent.session
   const nodes = [...session.surface.nodes]
   const start = nodes.indexOf(target as SessionSeq)
@@ -125,7 +138,42 @@ function shadowedFrom(agent: Agent, target: number): SessionSeq[] {
 }
 
 /**
- * Append the replacement inside the open turn+step.
+ * Read the host's turn boundary fold.
+ *
+ * Every DSH composition that can run an agent registers `turnBoundary`; a
+ * missing fold means this is not a host this plugin can write a Turn into, so
+ * say so instead of guessing a number.
+ *
+ * @param ctx - host context carrying the projection registry.
+ * @param agent - agent whose session boundary is read.
+ * @returns the open turn (null between turns) and the last turn number.
+ * @throws when the `turnBoundary` projection is not registered.
+ */
+function boundaryOf(ctx: Context, agent: Agent): TurnBoundaryProjection {
+  const boundary = ctx.sessionProjections.stateOf(agent.session, 'turnBoundary')
+  if (boundary === undefined) throw new Error('redo: the host exposes no turnBoundary projection')
+  return boundary
+}
+
+/**
+ * Decide whether a retraction can be written now, and what it would write.
+ * @param ctx - host context carrying the projection registry.
+ * @param agent - agent whose session is inspected.
+ * @param target - session seq the human asked to retract.
+ * @returns the retraction to write, or why it cannot be written.
+ */
+function planRetraction(ctx: Context, agent: Agent, target: number): Retraction | Refusal {
+  const why = targetRefusal(agent, target)
+  if (why !== undefined) return why
+  const boundary = boundaryOf(ctx, agent)
+  // A Turn that is still open owns its Step; a second `turn/start` there is the
+  // corruption this guard exists to prevent.
+  if (boundary.openTurnStartSeq !== null) return 'busy'
+  return { turn: boundary.lastTurn + 1, shadowed: shadowedFrom(agent, target) }
+}
+
+/**
+ * Append the replacement inside an open turn+step.
  *
  * The replacement is an empty `system/message`: an empty system, developer, or
  * assistant node projects to no model message, and the Chat target hides a
@@ -133,16 +181,11 @@ function shadowedFrom(agent: Agent, target: number): SessionSeq[] {
  * always projects, so the model would receive an empty user turn.
  *
  * @param agent - agent whose session surface is rewritten.
- * @param target - seq of the user message to drop, together with the tail.
+ * @param shadowed - surface nodes the replacement shadows, oldest first.
  * @param turn - open turn that owns this append.
  * @param step - open step that owns this append.
- * @throws when the target is no longer part of the active context, or is not a
- *   human user message.
  */
-function rewind(agent: Agent, target: number, turn: number, step: number): void {
-  const why = refusalOf(agent, target)
-  if (why !== undefined) throw new Error(`redo: message ${target} ${REFUSAL_THROWN[why]}`)
-  const shadowed = shadowedFrom(agent, target)
+function appendReplacement(agent: Agent, shadowed: readonly SessionSeq[], turn: number, step: number): void {
   agent.session.append('system/message', {
     turn,
     step,
@@ -155,59 +198,44 @@ function rewind(agent: Agent, target: number, turn: number, step: number): void 
     },
   }, {
     surfaceOp: { op: 'replace', startSeq: shadowed[0] as SessionSeq, endSeq: shadowed[shadowed.length - 1] as SessionSeq },
-    sourceEventSeqs: shadowed,
+    sourceEventSeqs: [...shadowed],
   })
 }
 
 /**
- * Read the highest turn the log has opened.
- * @param agent - agent whose session log is read.
- * @returns the last turn number, or 0 before the first turn.
- */
-function latestTurn(agent: Agent): number {
-  let turn = 0
-  for (const event of agent.session.snapshotEvents()) {
-    if (event.type !== 'turn/start' && event.type !== 'turn/end') continue
-    const value = (event.data as { turn?: unknown }).turn
-    if (typeof value === 'number' && value > turn) turn = value
-  }
-  return turn
-}
-
-/**
- * Rewind the context now, opening and closing the Turn that carries it.
+ * Write the retraction the plan describes, opening and closing its Turn.
  *
- * A retraction is a transcript fact, not a queued intention: the human clicked,
- * so the message leaves the model context immediately. No Step is requested, so
- * the loop never calls a model for this Turn.
+ * No Step is requested beyond the one the replacement needs, so the loop never
+ * calls a model for this Turn.
  *
  * @param agent - agent whose session is rewritten.
- * @param target - seq of the user message to drop, together with the tail.
- * @throws when the target cannot be rewound, or when the session refuses the
- *   turn+step coordinates.
+ * @param plan - turn number and shadowed nodes, already decided.
  */
-function retract(agent: Agent, target: number): void {
-  const why = refusalOf(agent, target)
-  if (why !== undefined) throw new Error(`redo: message ${target} ${REFUSAL_THROWN[why]}`)
-  const shadowed = shadowedFrom(agent, target)
-  const turn = latestTurn(agent) + 1
-  agent.session.append('turn/start', { turn })
-  agent.session.append('step/start', { turn, step: 1 })
-  agent.session.append('system/message', {
-    turn,
-    step: 1,
-    message: {
-      id: randomUUID() as never,
-      role: 'system',
-      source: { kind: 'system-prompt' },
-      content: [],
-    },
-  }, {
-    surfaceOp: { op: 'replace', startSeq: shadowed[0] as SessionSeq, endSeq: shadowed[shadowed.length - 1] as SessionSeq },
-    sourceEventSeqs: shadowed,
-  })
-  agent.session.append('step/end', { turn, step: 1 })
-  agent.session.append('turn/end', { turn, reason: { kind: 'completed' } })
+function retract(agent: Agent, plan: Retraction): void {
+  agent.session.append('turn/start', { turn: plan.turn })
+  agent.session.append('step/start', { turn: plan.turn, step: 1 })
+  appendReplacement(agent, plan.shadowed, plan.turn, 1)
+  agent.session.append('step/end', { turn: plan.turn, step: 1 })
+  agent.session.append('turn/end', { turn: plan.turn, reason: { kind: 'completed' } })
+}
+
+/**
+ * Rewind the context inside the Step that is already open — the retry path.
+ *
+ * Here the host owns the boundaries: `turn` and `step` come from the hook, so
+ * only the replacement is this plugin's to write.
+ *
+ * @param agent - agent whose session surface is rewritten.
+ * @param target - seq of the user message to drop, together with the tail.
+ * @param turn - open turn that owns this append.
+ * @param step - open step that owns this append.
+ * @throws when the target is no longer part of the active context, or is not a
+ *   human user message.
+ */
+function rewind(agent: Agent, target: number, turn: number, step: number): void {
+  const why = targetRefusal(agent, target)
+  if (why !== undefined) throw new Error(`redo: ${REFUSAL[why]}`)
+  appendReplacement(agent, shadowedFrom(agent, target), turn, step)
 }
 
 /**
@@ -224,7 +252,8 @@ function parseTarget(rawInput: string): number | undefined {
 
 /**
  * Install the redo hooks and the retract command.
- * @param ctx - host context carrying the agent registry and the command registry.
+ * @param ctx - host context carrying the agent registry, command registry, and
+ *   the session projections this plugin reads turn boundaries from.
  */
 export function apply(ctx: Context): void {
   const plans = new WeakMap<Agent, RedoPlan>()
@@ -239,10 +268,10 @@ export function apply(ctx: Context): void {
     handler: (invocation: CommandInvocation): CommandResult => {
       const parsed = parseTarget(invocation.rawInput)
       if (parsed === undefined) return { kind: 'error', text: `redo: usage ${USAGE}` }
-      const why = refusalOf(invocation.agent, parsed)
-      if (why !== undefined) return { kind: 'error', text: `redo: ${REFUSAL_SHOWN[why]}` }
+      const plan = planRetraction(ctx, invocation.agent, parsed)
+      if (typeof plan === 'string') return { kind: 'error', text: `redo: ${REFUSAL[plan]}` }
       try {
-        retract(invocation.agent, parsed)
+        retract(invocation.agent, plan)
         return { kind: 'success' }
       } catch (thrown) {
         return { kind: 'error', text: thrown instanceof Error ? thrown.message : String(thrown) }

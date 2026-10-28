@@ -4,6 +4,7 @@
   <p>编辑或重试已经发出去的用户消息，并原地重新生成——不新建会话、不重开对话。</p>
   <p>
     <a href="https://www.npmjs.com/package/dsh-redo"><img src="https://img.shields.io/npm/v/dsh-redo?style=flat-square&color=CB3837" alt="npm version"></a>
+    <a href="https://www.npmjs.com/package/dsh-redo"><img src="https://img.shields.io/npm/dm/dsh-redo?style=flat-square" alt="npm downloads"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3da639?style=flat-square" alt="License: MIT"></a>
     <img src="https://img.shields.io/badge/DSH-0.2.x-4D6BFE?style=flat-square" alt="DeepSeek Harness 0.2.x">
     <img src="https://img.shields.io/badge/platform-web-6B7280?style=flat-square" alt="Platform: web">

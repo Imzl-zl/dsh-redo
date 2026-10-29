@@ -12,7 +12,7 @@
  */
 
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs'
-import { zstdCompressSync, zstdDecompressSync } from 'node:zlib'
+import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 
 import { assertReleasedV4Relationships } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 
@@ -69,9 +69,28 @@ if (dryRun) {
 
 const backup = `${file}.bak-${new Date().toISOString().replaceAll(':', '-')}`
 copyFileSync(file, backup)
-const text = `${[header, ...events].map(row => JSON.stringify(row)).join('\n')}\n`
-writeFileSync(file, zstdCompressSync(Buffer.from(text, 'utf8')))
+// The container is a concatenation of independently decodable frames, and the
+// reader requires the **first** frame to hold exactly the header line
+// (session-persistence-jsonl: "first frame is not exactly one header line").
+// So write two frames: the header alone, then every event.
+const headerFrame = compress(`${JSON.stringify(header)}\n`)
+const bodyFrame = compress(`${events.map(event => JSON.stringify(event)).join('\n')}\n`)
+writeFileSync(file, Buffer.concat([headerFrame, bodyFrame]))
+const written = readFileSync(file).subarray(0, headerFrame.length)
+const headerLines = zstdDecompressSync(written).toString('utf8').split('\n').filter(line => line !== '')
+if (headerLines.length !== 1) throw new Error(`first frame must hold exactly one header line, holds ${String(headerLines.length)}`)
 console.log(`repaired ${String(events.length)} events; backup at ${backup}`)
+
+/**
+ * Compress one independently decodable, checksummed Zstandard frame.
+ * @param text - the plaintext to encode.
+ * @returns the encoded frame.
+ */
+function compress(text) {
+  return zstdCompressSync(Buffer.from(text, 'utf8'), {
+    params: { [constants.ZSTD_c_checksumFlag]: 1 },
+  })
+}
 
 /**
  * Split a zstd file into its append frames and concatenate the decoded text.

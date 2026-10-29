@@ -1,6 +1,6 @@
 {
   "name": "dsh-redo",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Edit or retry an already-sent user message and regenerate in place: rewinds the model context to that message without leaving the session",
   "type": "module",
   "main": "lib/index.js",

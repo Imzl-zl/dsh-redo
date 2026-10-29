@@ -9,6 +9,10 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-29
+
+Built against DSH `0.2.1-rc.3`.
+
 ### Changed
 
 - **编辑重发不再自己开 Turn。** 点击只登记目标（`/redo <seq>` 一个事件都不写），客户端立刻隐藏该行、把文字和
@@ -167,7 +171,8 @@ Initial release.
   empty `system/message` as the replacement so it never projects to a model message.
 - Inline confirmation before a mid-conversation rewrite, with the number of turns it drops.
 
-[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.2.1...v0.3.0

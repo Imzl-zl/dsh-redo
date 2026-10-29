@@ -89,7 +89,7 @@ npm run build       # 产物 lib/ 不入库
 
 ## 友链
 
-<a href="https://linux.do"><img src="assets/linuxdo.png" width="20" height="20" alt="Linux.do" align="absmiddle"> Linux.do</a>
+<a href="https://linux.do"><img src="assets/linuxdo.png" width="24" height="24" alt="Linux.do" align="absmiddle"> <strong>Linux.do</strong></a>
 
 ## License
 

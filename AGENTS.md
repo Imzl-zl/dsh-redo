@@ -106,6 +106,7 @@ npm run build       # lib/index.js + lib/client.js
 npm run typecheck
 node scripts/dump-session.mjs <session.v4.jsonl.zstd>            # 解码会话日志
 node scripts/check-sessions.mjs <会话目录或文件>                  # 用上游 V4 校验器逐份冷读，报第一处坏事件
+node scripts/repair-session.mjs <session.v4.jsonl.zstd>           # 修 turn 号撞车：从第一处错位起整体后移，备份+校验后才写盘
 ```
 
 上游源码仍**未安装依赖**；需要跑上游测试时才 `pnpm install`。

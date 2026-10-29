@@ -69,4 +69,5 @@ requestId 里的目标按纯数字解析（`/^(\d+):/`）；`Number()` 会把 `r
 ```sh
 node scripts/dump-session.mjs <session.v4.jsonl.zstd>   # 解码一份会话
 node scripts/check-sessions.mjs <目录或文件>             # 用上游 V4 校验器逐份冷读，报第一处坏事件
+node scripts/repair-session.mjs <日志>                   # 修 turn 号撞车（先 --dry-run 验证，写盘前自动备份）
 ```

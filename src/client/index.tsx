@@ -4,9 +4,10 @@
  * Replaces the keyed `user` Chat node cell so one human message gains two
  * actions: retry it as-is, or move it back into the composer and let the next
  * send rewrite it. Retry sends through the ordinary prompt Remote with a
- * `redo:` request id; edit rewinds the Host **at the click** through the
- * `/redo <seq>` command and refills the composer, so the send itself is an
- * ordinary composer submission — the same one the user would type by hand.
+ * `redo:` request id; edit arms the Host through the `/redo <seq>` command,
+ * hides the row and refills the composer, and the replacement is written when
+ * that message is sent — so the send itself is an ordinary composer submission,
+ * the same one the user would type by hand.
  *
  * Replacing an occupied keyed cell is a supported extension point, but it
  * means this package owns the user row's layout. The bubble itself is still
@@ -184,12 +185,39 @@ const RANGES = new Map<string, readonly SupersededInterval[]>()
  */
 const RETRACTIONS = new Map<string, readonly number[]>()
 
+/**
+ * Sequenced messages the human armed but has not sent yet, per Session.
+ *
+ * `编辑重发` arms the Host and refills the composer; the replacement is written
+ * when that message is sent, so between the click and the send the log still
+ * holds the message. The row hides anyway — this map is what tells it to — and
+ * the entry drops as soon as the event window carries the replacement (see
+ * `rangeFeed`), or after {@link PENDING_TTL_MS}, which is the Host's own arm
+ * window.
+ */
+const PENDING = new Map<string, Map<number, number>>()
+
+/** The Host drops an unused arm after five minutes; the local mark matches it. */
+const PENDING_TTL_MS = 5 * 60 * 1000
+
+/**
+ * Whether an armed message is waiting for its send.
+ * @param sessionId - owning Session.
+ * @param seq - message seq to test.
+ * @returns true while the row is hidden by the local arm rather than by the log.
+ */
+function isPendingSeq(sessionId: string, seq: number): boolean {
+  return PENDING.get(sessionId)?.has(seq) === true
+}
+
 /** One Session's hidden-set feed, identity-stable so every row shares it. */
 interface RangeFeed {
   /** Subscribe to hidden-set changes. */
   readonly subscribe: (listener: () => void) => () => void
   /** @returns the feed revision, a safe `useSyncExternalStore` snapshot. */
   readonly revision: () => number
+  /** Hide `seq` until the send writes its replacement, or the arm expires. */
+  readonly markPending: (seq: number) => void
 }
 
 /**
@@ -865,6 +893,8 @@ export function apply(ctx: Context): void {
     if (existing !== undefined) return existing
     let revision = 0
     const listeners = new Set<() => void>()
+    const pending = PENDING.get(id) ?? new Map<number, number>()
+    PENDING.set(id, pending)
     const publish = (intervals: readonly SupersededInterval[], turns: readonly number[]) => {
       const previous = RANGES.get(id)
       const previousTurns = RETRACTIONS.get(id)
@@ -880,7 +910,11 @@ export function apply(ctx: Context): void {
         && previousTurns.every((turn, index) => turn === turns[index])
       RANGES.set(id, intervals)
       RETRACTIONS.set(id, turns)
-      if (sameRanges && sameTurns) return
+      // Once the log covers a pending target the event window owns the hide, so
+      // the local mark goes away — this is also how the entry survives a send.
+      const before = pending.size
+      for (const seq of [...pending.keys()]) if (covers(intervals, seq)) pending.delete(seq)
+      if (sameRanges && sameTurns && pending.size === before) return
       revision += 1
       for (const listener of listeners) listener()
     }
@@ -908,6 +942,25 @@ export function apply(ctx: Context): void {
         return () => { listeners.delete(listener) }
       },
       revision: () => revision,
+      // The Host rewrites at the next send, so between the click and that send
+      // nothing in the log says the message is gone. The row hides right away
+      // anyway; the mark expires with the Host's own arm window, and the event
+      // window takes the hide over once the replacement lands.
+      markPending: (seq) => {
+        pending.set(seq, Date.now())
+        revision += 1
+        for (const listener of listeners) listener()
+        const timer = setTimeout(() => {
+          if (pending.get(seq) === undefined) return
+          if (covers(RANGES.get(id) ?? [], seq)) return
+          pending.delete(seq)
+          revision += 1
+          for (const listener of listeners) listener()
+        }, PENDING_TTL_MS)
+        // A node timer must not hold a browser session open; the mark is
+        // advisory state, so it may be dropped with the page.
+        ;(timer as { unref?: () => void }).unref?.()
+      },
     }
     rangeFeeds.set(id, feed)
     return feed
@@ -973,7 +1026,7 @@ export function apply(ctx: Context): void {
       isRunning: runningSource(sessionId).isRunning,
       subscribeSuperseded: rangeFeed(sessionId).subscribe,
       supersededRevision: rangeFeed(sessionId).revision,
-      isHidden: (seq) => isSupersededSeq(sessionId, seq),
+      isHidden: (seq) => isSupersededSeq(sessionId, seq) || isPendingSeq(sessionId, seq),
       shadowedCommandKeys: shadowedCommandKeys(sessionId),
       retractionTurns: retractionTurns(sessionId),
       laterTurns: (target) => {
@@ -1002,9 +1055,9 @@ export function apply(ctx: Context): void {
         // another client. A retraction mid-turn would rewrite the turn in flight.
         if (session.getSnapshot().running) return { ok: false, code: 'running' }
         // Stored images are read back as bytes and staged as ordinary composer
-        // drafts, so the send path stays the one the user knows. This happens
-        // *before* the retraction: once the command lands the message is gone,
-        // and a failed read would have taken its images with it.
+        // drafts, so the send path stays the one the user knows. The bytes are
+        // read before the arm: a failed read must not leave the Host pointed at
+        // a message whose images can no longer be recovered.
         const files: File[] = []
         for (const [index, image] of images.entries()) {
           const stored = await session.readAttachment(image.attachmentId)
@@ -1018,17 +1071,21 @@ export function apply(ctx: Context): void {
         const drafts = files.length === 0
           ? []
           : conversationDrafts(ctx).createDrafts(sessionId as SessionId, files, true)
-        // The retraction is the click: the Host rewinds the context right here,
-        // inside a Turn it opens and closes for exactly this append. The full
-        // acknowledgment is read, not just "the command matched": a refused
-        // click rewrites nothing, and refilling the composer anyway is the one
-        // outcome this action must not produce.
+        // The click only arms the Host: it records the target and writes
+        // nothing, so this plugin never opens a Turn the loop's counter cannot
+        // see. The replacement lands when the user sends, inside the step the
+        // loop opened for that send. The full acknowledgment is read, not just
+        // "the command matched" — a refused arm must not refill the composer.
         const verdict = classifyCommandRun(await remoteCommands(ctx).commands.execute(
           sessionId as SessionId,
           `/redo ${String(target)}`,
           [],
         ))
         if (!verdict.ok) return verdict
+        // Nothing in the log says this message is gone yet, so the row hides on
+        // the local arm and hands the job to the event window once the
+        // replacement lands (or reappears when the arm expires unsent).
+        rangeFeed(sessionId).markPending(target)
         return { ok: true, draftIds: drafts.map(draft => draft.id) }
       },
       resend: async (target, parts) => {

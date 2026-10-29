@@ -9,6 +9,23 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+### Changed
+
+- **编辑重发不再自己开 Turn。** 点击只登记目标（`/redo <seq>` 一个事件都不写），客户端立刻隐藏该行、把文字和
+  图片回填 composer；真正的 `surface replace` 在用户发送时由 `agent/request` 写进 **loop 已经打开的那一步**，
+  新的用户消息随后落盘，所以不会被遮蔽。模型请求看到的仍然只有新消息，时间线上也不会多一条。
+
+### Fixed
+
+- **会话被写坏：撤回的 Turn 与 loop 的计数器撞号。** loop 的 turn 号来自它自己的计数器
+  （`agent-loop/src/agent.ts:329`），只在创建 agent 时从日志读一次（`agent-loop/src/index.ts:569`）。0.3.x 的
+  命令在两步之间写了 `turn/start N+1`，loop 看不见它，下一次发送又写了同一个号，冷读直接以
+  `turn/start does not open the expected turn` 拒绝整份会话——2026-10-29 的一份 3700 事件会话就是这样坏的。
+  现在插件不再拥有任何 Turn，编号天然一致。
+- 登记有过期时间（5 分钟）并且**无论是否过期都消费一次**：点了编辑却一直不发送，那条消息会重新出现，
+  而不是在以后某次无关的发送里被悄悄改写。
+- 客户端仍然只在宿主**确认登记成功**后才回填 composer（`commands.execute` 的 `result.kind`），拒绝时显示宿主原文。
+
 ## [0.3.2] - 2026-10-29
 
 Built against DSH `0.2.1-rc.3`.

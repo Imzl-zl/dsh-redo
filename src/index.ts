@@ -2,44 +2,48 @@
  * dsh-redo — host half.
  *
  * Rewrites the model context in place from a chosen user message. Two entry
- * points, one append each:
+ * points feed it, and both end in the same append:
  *
- * - **Retract (edit).** The client sends `/redo <seq>`, and the command rewinds
- *   the context immediately: it opens a Turn, appends the replacement inside
- *   that Turn's only Step, and closes both. Nothing waits for the next send, so
- *   the message is gone from the model context the moment the human clicks —
- *   which is what a retraction means.
  * - **Retry.** The client sends an ordinary prompt whose request id carries
  *   `redo:<target>:<uuid>`, so `agent/pre-step` recognises the rewind from the
- *   message the loop just claimed, and `agent/request` writes it inside the open
- *   Step.
+ *   message the loop just claimed. Nothing else changes: the prompt text itself
+ *   is the regenerated message.
+ * - **Edit in the composer.** The client calls the `/redo <seq>` command, which
+ *   only *arms* a target; the user then edits and sends from the composer with
+ *   the identity the composer mints. The arm is a latch bound to one agent and
+ *   consumed by the next claimed human prompt, within {@link ARM_TTL_MS}.
  *
  * The session is append-only, so nothing is deleted — one surface replacement
  * shadows the old message and everything the turns after it produced, and the
  * replacement node itself projects to no model message.
  *
- * Turn boundaries belong to the host, and this plugin reads them from the very
- * fold the loop and the log reader use (`turnBoundary`): a `turn/start` opens a
- * Turn only in a closed log, and only with the number that follows the last one.
- * So a retraction is offered **between** Turns and refused inside one, and the
- * Turn it opens is numbered by that same projection rather than by a scan of the
- * log — the loop's next Turn then takes the number after this one, which is the
- * only way a later cold read can still accept the log.
+ * **This plugin never opens a turn.** Turn numbers belong to the loop: it seeds
+ * its counter from the log once, when the agent is created
+ * (`agent-loop/src/index.ts:569`), then increments it privately
+ * (`agent.ts:329`). A turn appended from here would not advance that counter, so
+ * the loop's next turn reused the same number and the next history load refused
+ * the whole session with `turn/start does not open the expected turn`. Both
+ * entry points therefore write inside a turn **the loop already opened**:
+ * `agent/request` runs after `step/start` and before the request is built, which
+ * is the only public place where a message-producing event may legally be
+ * appended with the step's coordinates.
+ *
+ * The armed latch is deliberately the destructive kind of state: if it is stale
+ * it rewrites a message the human did not mean. {@link ARM_TTL_MS} bounds that,
+ * the next human prompt consumes it, and an explicit `redo:` request id always
+ * wins over it.
  *
  * @module dsh-redo
  */
 
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, TurnBoundaryProjection } from '@deepseek-ai/dsh-agent'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import type { SessionSeq } from '@deepseek-ai/dsh-session'
-// Service-and-map augmentation only: `ctx.sessionProjections` and the
-// `turnBoundary` entry this plugin reads are declared there, not here.
-import type {} from '@deepseek-ai/dsh-session-projection'
 
 export const name = 'redo'
-export const inject = ['agents', 'commands', 'sessionProjections']
+export const inject = ['agents', 'commands']
 
 /** Prefix the client writes into the prompt request id of a retry. */
 const REDO_PREFIX = 'redo:'
@@ -54,10 +58,13 @@ const REDO_PREFIX = 'redo:'
  */
 const REDO_REQUEST_ID = /^(\d+):/
 
-/** What the `/redo` command accepts. */
-const USAGE = '/redo <message seq>'
+/** How long an armed composer rewrite waits for the next human prompt. */
+const ARM_TTL_MS = 5 * 60 * 1000
 
-/** One pending retry, recorded at pre-step and consumed at request. */
+/** What the `/redo` command accepts. */
+const USAGE = '/redo <message seq>|off'
+
+/** One pending rewind, recorded at pre-step and consumed at request. */
 interface RedoPlan {
   readonly turn: number
   readonly step: number
@@ -65,29 +72,40 @@ interface RedoPlan {
   readonly target: number
 }
 
-/**
- * Why a retraction cannot be written right now.
- *
- * `busy` is not a client-visible nicety: a Turn that is still open owns the
- * Step the loop is writing into, and opening another Turn behind it is the one
- * thing a cold read refuses (`turn/start does not open the expected turn`).
- */
-type Refusal = 'missing' | 'head' | 'not-user' | 'busy'
+/** One armed composer rewrite, waiting for the next human prompt. */
+interface ArmedTarget {
+  /** Session seq the next prompt should rewrite. */
+  readonly target: number
+  /** Unix epoch ms of the arming click, bounded by {@link ARM_TTL_MS}. */
+  readonly at: number
+}
 
-/** Host-facing text for one refusal, shared by both entry points. */
-const REFUSAL: Record<Refusal, string> = {
+/** Why a target cannot be rewritten. */
+type Refusal = 'missing' | 'head' | 'not-user'
+
+/** Host-facing text for one refusal, thrown into the turn. */
+const REFUSAL_THROWN: Record<Refusal, string> = {
+  missing: 'is no longer part of the active context',
+  head: 'is the protected session head',
+  'not-user': 'is not a human user message',
+}
+
+/** Human-facing text for one refusal, returned as the command result. */
+const REFUSAL_SHOWN: Record<Refusal, string> = {
   missing: 'that message is no longer part of the conversation context',
   head: 'the first message of a session cannot be rewritten',
   'not-user': 'only a message you sent can be rewritten',
-  busy: 'the session is still generating; retract once the turn has ended',
 }
 
-/** Everything one retraction writes, read in a single pass. */
-interface Retraction {
-  /** Turn the retraction opens: the host's next turn number. */
-  readonly turn: number
-  /** Surface nodes the replacement shadows: the target through the current tail. */
-  readonly shadowed: SessionSeq[]
+/**
+ * Whether one claimed message is a human prompt the composer sent.
+ * @param source - the claimed message's producer source.
+ * @returns true for a user prompt, which carries a client-minted request id.
+ */
+function isHumanPrompt(source: unknown): boolean {
+  if (typeof source !== 'object' || source === null) return false
+  const record = source as { kind?: unknown; rpcId?: unknown }
+  return record.kind === 'user' && typeof record.rpcId === 'string'
 }
 
 /**
@@ -107,12 +125,12 @@ function redoTarget(source: unknown): number | undefined {
 }
 
 /**
- * Whether `target` is a message this plugin may rewrite at all.
+ * Whether `target` can be rewritten right now.
  * @param agent - agent whose session surface is inspected.
  * @param target - session seq the human asked to redo.
- * @returns the refusal, or undefined when the target itself is rewritable.
+ * @returns the refusal, or undefined when the rewind is legal.
  */
-function targetRefusal(agent: Agent, target: number): Refusal | undefined {
+function refusalOf(agent: Agent, target: number): Refusal | undefined {
   const session = agent.session
   const nodes = [...session.surface.nodes]
   const start = nodes.indexOf(target as SessionSeq)
@@ -127,65 +145,29 @@ function targetRefusal(agent: Agent, target: number): Refusal | undefined {
 }
 
 /**
- * The surface nodes from `target` to the current tail, oldest first.
- * @param agent - agent whose session surface is inspected.
- * @param target - first node to shadow.
- * @returns the shadowed nodes, which also become `sourceEventSeqs`.
- */
-function shadowedFrom(agent: Agent, target: number): SessionSeq[] {
-  const nodes = [...agent.session.surface.nodes]
-  return nodes.slice(nodes.indexOf(target as SessionSeq))
-}
-
-/**
- * Read the host's turn boundary fold.
- *
- * Every DSH composition that can run an agent registers `turnBoundary`; a
- * missing fold means this is not a host this plugin can write a Turn into, so
- * say so instead of guessing a number.
- *
- * @param ctx - host context carrying the projection registry.
- * @param agent - agent whose session boundary is read.
- * @returns the open turn (null between turns) and the last turn number.
- * @throws when the `turnBoundary` projection is not registered.
- */
-function boundaryOf(ctx: Context, agent: Agent): TurnBoundaryProjection {
-  const boundary = ctx.sessionProjections.stateOf(agent.session, 'turnBoundary')
-  if (boundary === undefined) throw new Error('redo: the host exposes no turnBoundary projection')
-  return boundary
-}
-
-/**
- * Decide whether a retraction can be written now, and what it would write.
- * @param ctx - host context carrying the projection registry.
- * @param agent - agent whose session is inspected.
- * @param target - session seq the human asked to retract.
- * @returns the retraction to write, or why it cannot be written.
- */
-function planRetraction(ctx: Context, agent: Agent, target: number): Retraction | Refusal {
-  const why = targetRefusal(agent, target)
-  if (why !== undefined) return why
-  const boundary = boundaryOf(ctx, agent)
-  // A Turn that is still open owns its Step; a second `turn/start` there is the
-  // corruption this guard exists to prevent.
-  if (boundary.openTurnStartSeq !== null) return 'busy'
-  return { turn: boundary.lastTurn + 1, shadowed: shadowedFrom(agent, target) }
-}
-
-/**
- * Append the replacement inside an open turn+step.
+ * Rewind the model context to `target` inside the open step.
  *
  * The replacement is an empty `system/message`: an empty system, developer, or
  * assistant node projects to no model message, and the Chat target hides a
  * system node that entered by replacement. A user message cannot be used — it
  * always projects, so the model would receive an empty user turn.
  *
+ * `agent/request` runs before the claimed prompt is appended, so the shadowed
+ * range ends at the surface tail as it stands now: the new message, written
+ * afterwards, survives and becomes the head of the context.
+ *
  * @param agent - agent whose session surface is rewritten.
- * @param shadowed - surface nodes the replacement shadows, oldest first.
+ * @param target - seq of the user message to drop, together with the tail.
  * @param turn - open turn that owns this append.
  * @param step - open step that owns this append.
+ * @throws when the target is no longer part of the active context, or is not a
+ *   human user message.
  */
-function appendReplacement(agent: Agent, shadowed: readonly SessionSeq[], turn: number, step: number): void {
+function rewind(agent: Agent, target: number, turn: number, step: number): void {
+  const why = refusalOf(agent, target)
+  if (why !== undefined) throw new Error(`redo: message ${target} ${REFUSAL_THROWN[why]}`)
+  const nodes = [...agent.session.surface.nodes]
+  const shadowed = nodes.slice(nodes.indexOf(target as SessionSeq))
   agent.session.append('system/message', {
     turn,
     step,
@@ -198,84 +180,51 @@ function appendReplacement(agent: Agent, shadowed: readonly SessionSeq[], turn: 
     },
   }, {
     surfaceOp: { op: 'replace', startSeq: shadowed[0] as SessionSeq, endSeq: shadowed[shadowed.length - 1] as SessionSeq },
-    sourceEventSeqs: [...shadowed],
+    sourceEventSeqs: shadowed,
   })
-}
-
-/**
- * Write the retraction the plan describes, opening and closing its Turn.
- *
- * No Step is requested beyond the one the replacement needs, so the loop never
- * calls a model for this Turn.
- *
- * @param agent - agent whose session is rewritten.
- * @param plan - turn number and shadowed nodes, already decided.
- */
-function retract(agent: Agent, plan: Retraction): void {
-  agent.session.append('turn/start', { turn: plan.turn })
-  agent.session.append('step/start', { turn: plan.turn, step: 1 })
-  appendReplacement(agent, plan.shadowed, plan.turn, 1)
-  agent.session.append('step/end', { turn: plan.turn, step: 1 })
-  agent.session.append('turn/end', { turn: plan.turn, reason: { kind: 'completed' } })
-}
-
-/**
- * Rewind the context inside the Step that is already open — the retry path.
- *
- * Here the host owns the boundaries: `turn` and `step` come from the hook, so
- * only the replacement is this plugin's to write.
- *
- * @param agent - agent whose session surface is rewritten.
- * @param target - seq of the user message to drop, together with the tail.
- * @param turn - open turn that owns this append.
- * @param step - open step that owns this append.
- * @throws when the target is no longer part of the active context, or is not a
- *   human user message.
- */
-function rewind(agent: Agent, target: number, turn: number, step: number): void {
-  const why = targetRefusal(agent, target)
-  if (why !== undefined) throw new Error(`redo: ${REFUSAL[why]}`)
-  appendReplacement(agent, shadowedFrom(agent, target), turn, step)
 }
 
 /**
  * Parse the `/redo` argument.
  * @param rawInput - command text after the verb, verbatim.
- * @returns the target seq, or undefined when malformed.
+ * @returns the armed target, `'off'` to disarm, or undefined when malformed.
  */
-function parseTarget(rawInput: string): number | undefined {
+function parseArmTarget(rawInput: string): number | 'off' | undefined {
   const trimmed = rawInput.trim()
+  if (trimmed === 'off') return 'off'
   if (!/^\d+$/u.test(trimmed)) return undefined
   const parsed = Number(trimmed)
   return Number.isSafeInteger(parsed) ? parsed : undefined
 }
 
 /**
- * Install the redo hooks and the retract command.
- * @param ctx - host context carrying the agent registry, command registry, and
- *   the session projections this plugin reads turn boundaries from.
+ * Install the redo hooks and the arming command.
+ * @param ctx - host context carrying the agent registry and the command registry.
  */
 export function apply(ctx: Context): void {
   const plans = new WeakMap<Agent, RedoPlan>()
+  const armed = new WeakMap<Agent, ArmedTarget>()
 
-  // The client half calls this when the human clicks 编辑重发: the retraction is
-  // written here and now, which is the only way the message can leave the model
-  // context without waiting for the next send.
+  // Programmatic arming: the client half calls this to turn the *next* composer
+  // send into a rewrite, which is the only way to keep the composer native —
+  // its submission request id is minted by the composer and cannot be injected.
+  // Nothing is written here: a turn opened from this command would carry a
+  // number the loop's own counter never sees, and its next turn would reuse it.
   ctx.effect(() => ctx.commands.register({
     name: 'redo',
-    description: 'Retract a sent message: it leaves the conversation now, and its content goes back to the composer',
-    input: { hint: '<message seq>' },
+    description: 'Rewrite the conversation from an earlier message: the next message you send replaces it',
+    input: { hint: '<message seq>|off' },
     handler: (invocation: CommandInvocation): CommandResult => {
-      const parsed = parseTarget(invocation.rawInput)
+      const parsed = parseArmTarget(invocation.rawInput)
       if (parsed === undefined) return { kind: 'error', text: `redo: usage ${USAGE}` }
-      const plan = planRetraction(ctx, invocation.agent, parsed)
-      if (typeof plan === 'string') return { kind: 'error', text: `redo: ${REFUSAL[plan]}` }
-      try {
-        retract(invocation.agent, plan)
+      if (parsed === 'off') {
+        armed.delete(invocation.agent)
         return { kind: 'success' }
-      } catch (thrown) {
-        return { kind: 'error', text: thrown instanceof Error ? thrown.message : String(thrown) }
       }
+      const why = refusalOf(invocation.agent, parsed)
+      if (why !== undefined) return { kind: 'error', text: `redo: ${REFUSAL_SHOWN[why]}` }
+      armed.set(invocation.agent, { target: parsed, at: Date.now() })
+      return { kind: 'success' }
     },
   }), 'dsh-redo: redo command')
 
@@ -283,7 +232,20 @@ export function apply(ctx: Context): void {
     const explicit = messages
       .map(message => redoTarget(message.source))
       .find(target => target !== undefined)
-    if (explicit !== undefined) plans.set(agent, { turn, step, target: explicit })
+    if (explicit !== undefined) {
+      // A retry names its own target, so it outranks anything waiting in the
+      // composer — and the client that sent it expects exactly that interval.
+      armed.delete(agent)
+      plans.set(agent, { turn, step, target: explicit })
+      return next()
+    }
+    const pending = armed.get(agent)
+    if (pending !== undefined && messages.some(message => isHumanPrompt(message.source))) {
+      // One arm, one prompt: consume it even when it has expired, so a stale
+      // click cannot rewrite an unrelated message later in the session.
+      armed.delete(agent)
+      if (Date.now() - pending.at <= ARM_TTL_MS) plans.set(agent, { turn, step, target: pending.target })
+    }
     return next()
   })
 
@@ -298,5 +260,6 @@ export function apply(ctx: Context): void {
 
   ctx.on('agent/disposed', ({ agent }) => {
     plans.delete(agent)
+    armed.delete(agent)
   })
 }

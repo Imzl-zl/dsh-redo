@@ -30,19 +30,19 @@ DSH（DeepSeek Harness）是一个 append-only 的会话系统：消息一旦发
 ## 功能
 
 - **重新生成**：任意一条用户消息都能重发，不限于失败的消息——一键，不经过输入框。
-- **编辑重发＝点一下就地撤回**：那条消息连同它的回答立刻从对话里消失，不再回来；文字和图片原样回到
-  **底部输入框**，改完正常按发送就开始新的问答。用的就是原生 composer，不是插件自己的弹窗。
+- **编辑重发＝点一下回填，发送时替换**：那条消息连同它的回答立刻从对话里消失；文字和图片原样回到
+  **底部输入框**，改完按发送，旧的那段才真正被替换、新的内容顶上。用的就是原生 composer，不是插件自己的弹窗。
 - **图片跟着走**：存的图读回字节、重新挂成草稿，发送时一起上送；文件附件除外（见下）。
-- **旧内容真正离开上下文**：被重写的区间由 `surface replace` 遮蔽，旧消息和它之后的回答不再进入模型请求。
-- **整轮从时间线撤掉**：被重写的那一轮——你的消息、回答、工具卡、用量行——当场消失，新消息落在同一个位置，
-  看起来就像这条消息原地重新生成。`/redo` 命令卡也一起隐藏。刷新后依然如此：区间是从会话日志的
+- **旧内容真正离开上下文**：替换是一次 `surface replace`，旧消息和它之后的回答不再进入模型请求。
+  替换写在**发送那一轮的 step 里**（`agent/request`），所以插件从不自己开 turn——这是它不会再把日志写坏的原因。
+- **整轮从时间线撤掉**：被替换的那一轮——你的消息、回答、工具卡、用量行——当场消失，新消息落在同一个位置，
+  看起来就像这条消息原地重新生成。`/redo` 命令卡在被替换落盘后一起隐藏。刷新后依然如此：区间是从会话日志的
   `surface replace` 读回来的，不靠内存。
+- **点了不发会还原**：登记只有五分钟有效期，过期或刷新后那条消息重新出现——因为它确实还没被撤。
 - **原生操作行**：时间、复制、重新生成、编辑重发排在一起，尺寸、圆角、间距、悬停行为对齐原生。
 - **破坏性操作有确认**：撤回中段消息前会提示「之后的 N 轮对话会离开上下文」；输入框里本来有内容时再问一句是否替换。
 - **不会误触发**：撤回只影响你点的那条消息及其之后；其余会话、其余窗口不受影响。
 - **生成中禁用**：回答还在生成时两个按钮置灰，先停止再重发——不会把重发塞进输入框的排队区。
-  宿主端也照样挡：turn 还开着时 `/redo` 直接拒绝、一个事件都不写，所以即便按钮没来得及置灰（另一窗口正在
-  跑同一个会话），也不会把日志写成下次读不出来的样子。
 
 ### 不支持
 
@@ -107,17 +107,22 @@ dsh --profile redo-test --no-open --port 3111
 
 **宿主半**（`src/index.ts`）
 
-两条入口，同一个追加：
+两条入口，同一个追加，**并且都不开 turn**：
 
-1. **撤回（编辑）**：客户端调 `/redo <seq>`（`ctx.commands.register` 注册的宿主命令），命令**当场**写五个事件
-   ——`turn/start` → `step/start` → 空 content 的 `system/message`（`surfaceOp: replace target..surface 尾`）
-   → `step/end` → `turn/end`。没有消息进 inbox，这个 turn 不会被请求模型；日志坐标精确，冷读不会报错。
-   点一下，消息就从上下文里消失了。已有 turn 还开着时命令**拒绝执行**（一个事件都不写），见下一条。
-2. **重新生成**：客户端发送的 prompt 把目标写进 `requestId`（`redo:<seq>:<uuid>`），`agent/pre-step`
-   从认领到的消息上读回来，`agent/request` 在**已经打开的 step** 里写同样的替换。
+1. **编辑**：客户端调 `/redo <seq>`（`ctx.commands.register` 注册的宿主命令），命令**只登记**目标，
+   一个事件都不写。用户随后从 composer 发送，`agent/pre-step` 认领到这条人类消息时消费掉登记，
+   `agent/request` 在 loop 已经打开的 step 里写空 content 的 `system/message`
+   （`surfaceOp: replace target..surface 尾`）。替换发生在新的用户消息落盘之前，所以新消息不会被遮蔽。
+2. **重新生成**：客户端发送的 prompt 把目标写进 `requestId`（`redo:<seq>:<uuid>`），走同一条 pre-step →
+   request 通道。
+
+为什么不能自己开 turn：turn 号由 loop 的私有计数器决定（创建 agent 时从日志折叠取一次，之后自增），
+插件写进去的 turn 它看不见，下一次轮次就会复用同一个号，冷读直接报
+`turn/start does not open the expected turn`。注册式撤回把写入放进 loop 自己的 step，编号天然一致。
 
 为什么撤回要绕一道命令：composer 提交时的 requestId 由 `beginSubmission` 内部铸（`randomUUID()`），
-`BeginSubmissionInput` 不接受外部注入，所以没有钩子能在提交那一刻插手。命令是客户端唯一能主动让宿主「现在就把这段删掉」的公开通道。
+`BeginSubmissionInput` 不接受外部注入，所以没有钩子能在提交那一刻插手。命令是客户端唯一能主动让宿主
+「记住这段要作废」的公开通道。
 
 为什么命令要自己开一个 turn：`system/message` 只能落在已打开的 turn+step 内，而点击发生在 turn 之外。
 
@@ -156,30 +161,27 @@ turn 边界由宿主说了算：命令不扫日志、不自己算 turn 号，而
 
 ## 已验证
 
-**自动化**（`npm test`，28 项，跑在 `src/` 上，不需要构建）：宿主半锁「撤回命令写出的五个事件」顺序与坐标
-（turn/step 精确、turn 号取 `turnBoundary` 的 `lastTurn + 1`、不留 open step）、`sourceEventSeqs` 完整覆盖
-被遮蔽的 surface 尾、受保护的节点 0 拒绝改写、替换必须是空 system 而非 user、非法参数/越界目标/非人类消息
-全被拒且不碰日志；turn 还开着时撤回被拒且不写任何事件；`turnBoundary` 缺失时报错而不是猜编号。
-最后两项把插件写出的日志交给上游 `assertReleasedV4Relationships` 冷读——「关着的 turn 写出来必须可读」
-「开着的 turn 不许写」由宿主判定，不由插件自证。重试路线覆盖 plan 只消费一次、step 作用域、畸形 requestId
-不重写。客户端半锁区间推导与「撤回 turn」识别。CI 依次跑 `typecheck` → `test` → `build`。
+**自动化**（`npm test`，30 项，跑在 `src/` 上，不需要构建）：宿主半锁「命令只登记、一个事件都不写」、
+「替换写在 loop 认领的那个 turn/step 里」「`sourceEventSeqs` 完整覆盖被遮蔽的 surface 尾」、受保护的节点 0 拒绝改写、
+替换必须是空 system 而非 user、一条登记只驱动一次发送、过期登记不再改写、注入的 context 不消费登记、
+重试 requestId 压过登记且 plan 按 step 作用域只消费一次、各类拒绝一律不碰日志。最后一项把
+「loop 开 turn → 插件写替换 → 新消息落盘 → 收尾」整条日志交给上游 `assertReleasedV4Relationships` 冷读。
+客户端半锁区间推导与「只有 replace 没有 user 的 turn」的识别。CI 依次跑 `typecheck` → `test` → `build`。
 
-变异检验：收窄 `endSeq` / 让 `sourceEventSeqs` 少一个节点 / 去掉未关闭 turn 的门禁 / turn 号写成
-`lastTurn + 2`，每一种都会立刻有测试变红（前两类 1 项，后两类 2–3 项，含上游校验器那项）。
+变异检验：TTL 永不失效 / 去掉 step 作用域 / `sourceEventSeqs` 少一个节点 / 把 handler 的 `kind:'error'` 当成功，
+每一种都会立刻有测试变红（后两类各 2 项，含上游校验器那项）。
 
-诊断脚本：`node scripts/check-sessions.mjs <目录或日志>` 用上游校验器逐份冷读并指出第一处坏事件；
-`node scripts/verify-retract-safe.ts <日志>` 在一份真实日志上试一次撤回（关着的 turn 必须写出可读日志，
-开着的 turn 必须一个事件都不写）。
+诊断脚本：`node scripts/check-sessions.mjs <目录或日志>` 用上游校验器逐份冷读并指出第一处坏事件。
 
-**手工**（packaged `0.2.1-rc.2` GUI，`redo-test` profile + 本地 Cherry 网关）：
+**手工**（packaged GUI，`redo-test` profile + 本地 Cherry 网关）：
 
-- 20:1x 三条路径：文字编辑重发（模型上下文只剩改后文本，追问「能看到几条用户消息」答 2 而非 4）、图片编辑
-  重发（粘贴的图回填成草稿再发，模型仍能读到图）、一键重新生成。
-- 22:0x 整轮撤掉：重试最后一条 / 编辑 / 中段重试，被重写的那一轮（消息、回答、过程行、用量行）连同
-  `redo` 命令卡一起消失，新的一轮落在同一位置。
-- 22:5x **点击即撤回**：点「编辑重发」后 1.8 秒内时间线只剩 0 行，composer 拿到原文；日志里是
-  `turn/start` → `step/start` → `replace 8..18` → `step/end` → `turn/end`。重启实例冷读该会话正常，
-  **无 `SessionPersistenceCorruptionError`**，接着发消息正常开下一个 turn。
+- 10-29 15:25 **登记式（0.4）**：点「编辑重发」——消息立刻从时间线消失、composer 拿到原文，日志里**只有**
+  `command/run` + `command/done`，没有 turn、没有 replace。
+- 10-29 15:26 发送：画面只剩一条消息，刷新后仍是这一条；日志是
+  `turn/start 2`(loop) → `step/start` → `replace 8..18` → 新 `user/message` → 回答，冷读通过。
+- 10-29 14:37 **旧版事故存档**：0.3.x 的撤回写了 `turn/start 12`，loop 随后又写了一个 `turn/start 12`，
+  该会话从此冷读失败——这一版不再拥有 Turn，规避了整类问题。
+- 10-24 的图片回填、中段重试、一键重新生成仍按原样工作（替换逻辑未改，只改了写入时机）。
 
 排查现场用：
 

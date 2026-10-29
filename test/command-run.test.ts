@@ -19,7 +19,6 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { TurnBoundaryProjection } from '@deepseek-ai/dsh-agent'
 
 import { apply } from '../src/index.ts'
 import { classifyCommandRun } from '../src/client/command-run.ts'
@@ -67,15 +66,15 @@ function fakeSession(nodes: readonly number[], events: ReadonlyMap<number, unkno
 }
 
 /**
- * Run the real `/redo` handler once.
- * @param boundary - the host's turn fold for this click.
+ * Run the real `/redo` handler once against a session whose surface holds
+ * `nodes` (after the optional `mutate`).
+ * @param mutate - rewrite the surface before the click, as another window would.
  * @returns the handler's normalized result, untouched.
  */
-function runRedoUntilSettled(boundary: TurnBoundaryProjection): { kind: string, text?: string } {
+function runRedoUntilSettled(mutate?: (nodes: number[]) => void): { kind: string, text?: string } {
   const registered = new Map<string, { handler: (invocation: unknown) => unknown }>()
   const ctx = {
     commands: { register: (command: never) => { registered.set((command as { name: string }).name, command as never); return () => {} } },
-    sessionProjections: { stateOf: (_session: unknown, key: string) => (key === 'turnBoundary' ? boundary : undefined) },
     on: () => () => {},
     effect: (factory: () => unknown) => { factory() },
   }
@@ -83,7 +82,9 @@ function runRedoUntilSettled(boundary: TurnBoundaryProjection): { kind: string, 
 
   const command = registered.get('redo')
   assert.ok(command !== undefined, 'the /redo command was not registered')
-  const session = fakeSession([1, 9], new Map([[9, { type: 'user/message', data: { source: { kind: 'user' } } }]]))
+  const nodes = [1, 9]
+  mutate?.(nodes)
+  const session = fakeSession(nodes, new Map([[9, { type: 'user/message', data: { source: { kind: 'user' } } }]]))
   return command.handler({
     agent: { session },
     rawInput: '9',
@@ -94,26 +95,18 @@ function runRedoUntilSettled(boundary: TurnBoundaryProjection): { kind: string, 
 }
 
 test("the plugin's own refusal never reaches the composer as success", () => {
-  const result = runRedoUntilSettled({
-    openTurnStartSeq: 4 as never,
-    lastStepStartSeq: null,
-    lastStepBoundary: null,
-    lastTurn: 2,
-  })
+  // The target left the context (another window rewrote the session): the Host
+  // refuses the arm, and the composer must stay exactly as it was.
+  const result = runRedoUntilSettled(nodes => { nodes.splice(1, 1) })
 
-  assert.equal(result.kind, 'error', 'the host must refuse a click inside an open Turn')
+  assert.equal(result.kind, 'error', 'the host must refuse a target that left the context')
   const verdict = classifyCommandRun({ ok: true, value: { result } as never })
   assert.equal(verdict.ok, false, 'a refusal must never refill the composer')
   assert.equal(verdict.ok === false && verdict.message, result.text)
 })
 
-test('the same click between Turns settles as success', () => {
-  const result = runRedoUntilSettled({
-    openTurnStartSeq: null,
-    lastStepStartSeq: null,
-    lastStepBoundary: null,
-    lastTurn: 2,
-  })
+test('a legal target settles as success', () => {
+  const result = runRedoUntilSettled()
 
   assert.equal(result.kind, 'success')
   assert.deepEqual(classifyCommandRun({ ok: true, value: { result } as never }), { ok: true })

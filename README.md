@@ -17,212 +17,79 @@
 
 ## 这是什么
 
-DSH（DeepSeek Harness）是一个 append-only 的会话系统：消息一旦发出去，原生没有"改一下再发"的入口。
-**dsh-redo** 把这件事补上——选中任意一条自己发过的消息，改文字、删图、加图，或者原样再来一次，
-模型上下文会**原地回到那条消息之前**并重新生成，而不是开一个新会话。
-
-适合这些场景：
+DSH 的会话是只追加的日志，消息发出去就没有"改一下再发"的入口。**dsh-redo** 把这件事补上：选中任意一条
+自己发过的消息，改文字、换图片，或者原样再来一次，模型上下文会**原地回到那条消息之前**并重新生成。
 
 - 消息发错了（错字、贴错内容、图配错）→ 改完重发。
-- 回答不满意 / 渠道抽风 → 原样重发，不必等失败才能点。
-- 想换一个问法继续同一段对话 → 从任意一条消息重写，后面的内容作废。
+- 回答不满意或渠道抽风 → 原样重发，不用等它失败。
+- 想换个问法继续同一段对话 → 从任意一条消息重写，后面的内容作废。
 
 ## 功能
 
-- **重新生成**：任意一条用户消息都能重发，不限于失败的消息——一键，不经过输入框。
-- **编辑重发＝点一下回填，发送时替换**：那条消息连同它的回答立刻从对话里消失；文字和图片原样回到
-  **底部输入框**，改完按发送，旧的那段才真正被替换、新的内容顶上。用的就是原生 composer，不是插件自己的弹窗。
-- **图片跟着走**：存的图读回字节、重新挂成草稿，发送时一起上送；文件附件除外（见下）。
-- **旧内容真正离开上下文**：替换是一次 `surface replace`，旧消息和它之后的回答不再进入模型请求。
-  替换写在**发送那一轮的 step 里**（`agent/request`），所以插件从不自己开 turn——这是它不会再把日志写坏的原因。
-- **整轮从时间线撤掉**：被替换的那一轮——你的消息、回答、工具卡、用量行——当场消失，新消息落在同一个位置，
-  看起来就像这条消息原地重新生成。`/redo` 命令卡在被替换落盘后一起隐藏。刷新后依然如此：区间是从会话日志的
-  `surface replace` 读回来的，不靠内存。
-- **点了不发会还原**：登记只有五分钟有效期，过期或刷新后那条消息重新出现——因为它确实还没被撤。
-- **原生操作行**：时间、复制、重新生成、编辑重发排在一起，尺寸、圆角、间距、悬停行为对齐原生。
-- **破坏性操作有确认**：撤回中段消息前会提示「之后的 N 轮对话会离开上下文」；输入框里本来有内容时再问一句是否替换。
-- **不会误触发**：撤回只影响你点的那条消息及其之后；其余会话、其余窗口不受影响。
-- **生成中禁用**：回答还在生成时两个按钮置灰，先停止再重发——不会把重发塞进输入框的排队区。
-
-### 不支持
-
-- **文件附件**：prompt 的文件通道只接受本次会话上传换来的 receipt，客户端没有"按引用读取旧文件"的 RPC，
-  所以带文件的消息两个按钮置灰，而不是静默丢内容。
-- **太久以前的撤回不留痕**：区间是从事先加载的会话窗口里读的。一次重写如果发生在很早以前、已经落到
-  窗口之外，刷新后那批旧消息会重新出现——模型上下文仍然是对的，丢的只是界面上的「撤掉」。
-- **命令行手动输入 `/redo` 也会被藏**：命令卡按「它撤回的目标是否已被遮蔽」判断，插件发起的和你手敲的
-  记录长得一样，所以一起隐藏。
-- **账本里仍留着原文**：会话日志是只追加的，撤回追加一条 `replace`，不删原来那行。对模型和界面都已生效，
-  但 `dump-session` 或任何回放仍能看到你撤回掉的那条文本。
+- **重新生成**：任意一条用户消息都能重发，一键，不经过输入框。
+- **编辑重发**：消息连同它的回答立刻从对话里消失，文字和图片回到**底部输入框**；改完按发送，旧的那段被替换，
+  新的内容落在原位——不会多出一条。
+- **图片跟着走**：存的图读回字节、重新挂成草稿，发送时一起上送。
+- **破坏性操作有确认**：撤回中段消息前会说明之后有几轮离开上下文；输入框本来有内容时再问一句是否替换。
+- **生成中禁用**：回答还在生成时按钮置灰，先把当前回答处理掉。
 
 ## 安装
 
-需要 DSH `>= 0.2.0-rc.1 < 0.3.0`，并在 Web GUI 中使用。
-
-从 npm 装（发布物已含构建好的 `lib/`，无需自己 build）：
+需要 DSH `>= 0.2.0-rc.1 < 0.3.0`，在 Web GUI 里使用。发布物已含构建好的 `lib/`，不需要自己 build。
 
 ```sh
 dsh plugin --profile <profile> add dsh-redo
-dsh --profile <profile> --dump-config | grep redo   # 应看到 "== dsh-redo" 层
 dsh --profile <profile>
 ```
 
-或者从源码装（改代码、跟进未发布提交时用）：
+从源码装（改代码时用）：
 
 ```sh
-git clone https://github.com/Imzl-zl/dsh-redo.git
-cd dsh-redo
-npm install
-npm run build
-
+git clone https://github.com/Imzl-zl/dsh-redo.git && cd dsh-redo
+npm install && npm run build
 dsh plugin --profile <profile> add <本仓库绝对路径>
-```
-
-装完重启 GUI。想先拿独立 profile 试，可以用：
-
-```sh
-dsh --profile redo-test --from-default-profile web --dump-config
-dsh plugin --profile redo-test add <本仓库绝对路径>
-dsh --profile redo-test --no-open --port 3111
 ```
 
 ## 使用
 
 1. 鼠标移到任意一条**自己发的消息**上，气泡下方出现操作行。
-2. 点「重新生成」原样重发：一键，不经过输入框。
-3. 点「编辑重发」：这条消息**立刻从对话里撤掉**，文字和图片回到**底部输入框**。该问的会先问
-   （中段消息说明之后还有几轮会跟着离开；输入框本来不是空的问是否替换）。
-4. 在输入框里改完（增删图片、改文字都行），正常按发送——这一次发送就是在重写那段对话，新的那条落在
-   被撤掉的位置。撤掉这件事不设期限，草稿留着多久都行。
+2. **重新生成**：原样重发，一键完成。
+3. **编辑重发**：这条消息立刻从对话里消失，内容回到输入框。中段消息会先确认；输入框非空时会问是否替换。
+4. 改完按发送——这一次发送就是在重写那段对话。
 
-编辑不弹插件自己的对话框：内容进的是原生 composer，`@` 引用、斜杠命令、图片预览、Esc 撤销全是原生行为。
-**武装**这一步仍然会往时间线写一条 `/redo <seq>` 命令记录（成功、无输出），但发送完成、区间落定后，
-这张卡和它所在的那段对话会一起被撤掉，所以正常使用时看不到它。
+编辑用的是原生 composer，`@` 引用、斜杠命令、图片预览、Esc 撤销都是原生行为。
 
-带**文件**（非图片）的消息两个按钮置灰，因为客户端没有按引用读回旧文件的 RPC。
+## 限制
 
-## 工作原理
-
-两个半区，各干一件小事。插件**不改上游源码**，只使用公开扩展点。
-
-**宿主半**（`src/index.ts`）
-
-两条入口，同一个追加，**并且都不开 turn**：
-
-1. **编辑**：客户端调 `/redo <seq>`（`ctx.commands.register` 注册的宿主命令），命令**只登记**目标，
-   一个事件都不写。用户随后从 composer 发送，`agent/pre-step` 认领到这条人类消息时消费掉登记，
-   `agent/request` 在 loop 已经打开的 step 里写空 content 的 `system/message`
-   （`surfaceOp: replace target..surface 尾`）。替换发生在新的用户消息落盘之前，所以新消息不会被遮蔽。
-2. **重新生成**：客户端发送的 prompt 把目标写进 `requestId`（`redo:<seq>:<uuid>`），走同一条 pre-step →
-   request 通道。
-
-为什么不能自己开 turn：turn 号由 loop 的私有计数器决定（创建 agent 时从日志折叠取一次，之后自增），
-插件写进去的 turn 它看不见，下一次轮次就会复用同一个号，冷读直接报
-`turn/start does not open the expected turn`。注册式撤回把写入放进 loop 自己的 step，编号天然一致。
-
-为什么撤回要绕一道命令：composer 提交时的 requestId 由 `beginSubmission` 内部铸（`randomUUID()`），
-`BeginSubmissionInput` 不接受外部注入，所以没有钩子能在提交那一刻插手。命令是客户端唯一能主动让宿主
-「记住这段要作废」的公开通道。
-
-为什么命令要自己开一个 turn：`system/message` 只能落在已打开的 turn+step 内，而点击发生在 turn 之外。
-
-turn 边界由宿主说了算：命令不扫日志、不自己算 turn 号，而是读 `ctx.sessionProjections.stateOf(session,'turnBoundary')`
-——和 agent loop、日志读取器同一个折叠。没有打开的 turn 才写，编号取 `lastTurn + 1`；有打开的 turn 就拒绝。
-写盘前宿主不校验 turn 生命周期，所以这条不变式只能插件自己守，否则下一次加载历史会整份拒读
-（`turn/start does not open the expected turn`）。
-
-为什么必须是空 `system/message`：它是唯一同时满足「不产生模型消息」和「Chat 时间线不渲染」的节点类型；
-空 `user/message` 会被 `deriveEventMessage` 原样投影给 provider，空 `developer/message` 会多一行空上下文。
-
-**浏览器半**（`src/client/index.tsx`）
-
-- 接管 keyed `conversation.chat.node` 的 `user` 单元，气泡本体仍走官方 `conversation.chat.user.content` 工厂。
-- 操作行走原生 `MessageIconActions` 的度量与 token，自己补回时间与复制。
-- 回填：先调命令撤回，再 `inputActions.setDraft(text)` 写文字；存的图在**调命令之前**用 `session.readAttachment`
-  读回字节、包成 `File`、经 `conversation.createDrafts` 挂成草稿，最后由 `inputActions.addAttachments(ids)`
-  加进输入框——顺序反过来的话，读图失败会连消息一起丢。
-- 区间不靠客户端记账：每次撤回都是一条 `surfaceOp: { op: 'replace', startSeq, endSeq }` 追加，插件直接
-  从会话自己的事件窗口（`binding.eventSource`）把区间读回来（`src/client/intervals.ts`）。刷新后依然生效。
-- 撤掉的是**整轮**，不只是气泡：插件只接管了 `user` 单元，回答、工具卡、过程行、用量行都由官方 cell 渲染，
-  所以被遮蔽的那一行挂载后，会把它所在 Turn 的容器行（`data-chat-turn`）一并隐藏，`MutationObserver` 补上
-  晚到的行。插件为撤回开的那个空 turn 也会留下「已完成」和用量行，`deriveRetractionTurns` 按「有 replace、
-  没有 user 消息」把它认出来一起隐藏。`/redo` 命令卡不在任何 Turn 里，按「它撤回的目标是否已被遮蔽」识别。
-  都只作用在同一个 Chat flow 内，分屏不会串号。
-- `intervals.ts` 是纯函数：区间推导 + 撤回 turn 推导 + 判定，`test/intervals.test.ts` 直接锁它。
+- **点了不发会还原**：登记的有效期是 5 分钟，过期或刷新后那条消息重新出现——因为它确实还没被撤回。
+- **文件附件不支持**：带文件的消息两个按钮置灰，避免静默丢内容；图片不受影响。
+- **日志里仍留着原文**：会话是只追加的，撤回是追加一条遮蔽记录，不是删除。模型和界面都已生效，
+  但用脚本回放日志仍能看到被撤回的那条文本。
+- **很久以前的重写可能不再隐藏**：界面上的隐藏依赖已加载的会话窗口；一次很早的替换若已落到窗口之外，
+  刷新后旧消息会重新显示（模型上下文仍然正确）。
 
 ## 兼容性
 
 | 项目 | 说明 |
 | --- | --- |
 | DSH | `>= 0.2.0-rc.1 < 0.3.0`，实测 `0.2.1-rc.2` / `0.2.1-rc.3` |
-| 平台 | Web GUI（浏览器半只要求 shell 模块表里的 `react`） |
+| 平台 | Web GUI |
 | 扩展点 | keyed slot `conversation.chat.node`、`agent/pre-step`、`agent/request`、`ctx.commands` |
-| 测试 | Node 24（`node --test` 直接跑 TypeScript 源码，不走构建） |
-
-## 已验证
-
-**自动化**（`npm test`，30 项，跑在 `src/` 上，不需要构建）：宿主半锁「命令只登记、一个事件都不写」、
-「替换写在 loop 认领的那个 turn/step 里」「`sourceEventSeqs` 完整覆盖被遮蔽的 surface 尾」、受保护的节点 0 拒绝改写、
-替换必须是空 system 而非 user、一条登记只驱动一次发送、过期登记不再改写、注入的 context 不消费登记、
-重试 requestId 压过登记且 plan 按 step 作用域只消费一次、各类拒绝一律不碰日志。最后一项把
-「loop 开 turn → 插件写替换 → 新消息落盘 → 收尾」整条日志交给上游 `assertReleasedV4Relationships` 冷读。
-客户端半锁区间推导与「只有 replace 没有 user 的 turn」的识别。CI 依次跑 `typecheck` → `test` → `build`。
-
-变异检验：TTL 永不失效 / 去掉 step 作用域 / `sourceEventSeqs` 少一个节点 / 把 handler 的 `kind:'error'` 当成功，
-每一种都会立刻有测试变红（后两类各 2 项，含上游校验器那项）。
-
-诊断脚本：`node scripts/check-sessions.mjs <目录或日志>` 用上游校验器逐份冷读并指出第一处坏事件。
-
-**手工**（packaged GUI，`redo-test` profile + 本地 Cherry 网关）：
-
-- 10-29 15:25 **登记式（0.4）**：点「编辑重发」——消息立刻从时间线消失、composer 拿到原文，日志里**只有**
-  `command/run` + `command/done`，没有 turn、没有 replace。
-- 10-29 15:26 发送：画面只剩一条消息，刷新后仍是这一条；日志是
-  `turn/start 2`(loop) → `step/start` → `replace 8..18` → 新 `user/message` → 回答，冷读通过。
-- 10-29 14:37 **旧版事故存档**：0.3.x 的撤回写了 `turn/start 12`，loop 随后又写了一个 `turn/start 12`，
-  该会话从此冷读失败——这一版不再拥有 Turn，规避了整类问题。
-- 10-24 的图片回填、中段重试、一键重新生成仍按原样工作（替换逻辑未改，只改了写入时机）。
-
-排查现场用：
-
-```sh
-node scripts/dump-session.mjs <session.v4.jsonl.zstd>
-```
 
 ## 开发
 
 ```sh
 npm install
 npm test            # node --test，直接跑 TypeScript 源码
-npm run build       # lib/index.js + lib/client.js
 npm run typecheck
-node scripts/dump-session.mjs <session.v4.jsonl.zstd>   # 解码会话日志排查
+npm run build       # 产物 lib/ 不入库
 ```
 
-产物 `lib/` 不入库，克隆后需要先构建。宿主半只依赖 `node:crypto`；浏览器半只要求 shell 模块表里的
-`react`，运行时不会装出第二份框架实例。
-
-问题与建议欢迎开 issue / PR。
-
-## 变更记录与发版
-
-每个版本都记在 [CHANGELOG.md](CHANGELOG.md)，并标注它是针对哪个 DSH 版本构建的。
-
-发版是 **tag 驱动**的，不需要任何人手上有 token：
-
-```sh
-npm version patch        # 先跑 typecheck + 测试，再改版本号并打 tag
-# 把 CHANGELOG 的 Unreleased 段落改成这个版本号
-git push --follow-tags
-```
-
-`.github/workflows/release.yml` 会核验 tag 与 `package.json` 一致，然后通过 **npm trusted publishing
-（OIDC）** 发布并附 provenance。这个工作流文件被 npm 侧的 trusted publisher 配置按路径绑定，重命名或挪位置
-会让发布在 403 上失败——改路径时要去 npmjs.com 同步改一次。
+设计与实现细节见 [docs/design.md](docs/design.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 友链
 
-<a href="https://linux.do"><img src="assets/linuxdo.png" width="24" height="24" alt="Linux.do" align="absmiddle"> <strong>Linux.do</strong></a>
+<a href="https://linux.do"><img src="assets/linuxdo.png" width="20" height="20" alt="Linux.do" align="absmiddle"> Linux.do</a>
 
 ## License
 

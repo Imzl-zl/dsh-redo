@@ -19,7 +19,8 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
   宿主只从 profile 的 `node_modules` 解析插件，一份克隆会停在"装的那天"，改完代码也不生效——2026-10-29
   就因为那里是一份 10/26 的克隆，把"改完了"误当成"隔离实例里生效了"。宿主加载的是 `lib/`，所以链接后仍要
   `npm run build`。`desktop` 那份是 npm tarball 拷贝，属于发布形态，不要当开发入口。
-- 结论与接入点调研见 [docs/research/2026-10-24-edit-resend-seams.md](docs/research/2026-10-24-edit-resend-seams.md)。
+- 结论与接入点调研见 [docs/research/2026-10-24-edit-resend-seams.md](docs/research/2026-10-24-edit-resend-seams.md)；
+  面向人的设计与验证说明在 [docs/design.md](docs/design.md)，README 只放安装与用法。
 
 ## 不可违背的约束（读源码得出，别再试错）
 
@@ -126,31 +127,7 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 
 ## 已验证
 
-**自动化**：`npm test`（30 项）。
-`test/redo.test.ts`（15 项）管宿主半——**命令只登记、一个事件都不写**；替换写在 loop 认领的那个 turn/step 里，
-`sourceEventSeqs` 全覆盖被遮蔽的 surface 尾、节点 0 拒改、替换是空 system 而非 user；一条登记只驱动一次发送、
-过期（6 分钟）与已消费的登记都不再改写、注入的 context 不消费登记、`off` 与 agent 销毁清空登记；
-重试 requestId 压过登记、畸形 id 不重写、plan 只消费一次且按 step 作用域；
-拒绝路线（目标已离开 surface / 头节点 / 非人类消息 / 非法参数）一律不碰日志，发送前目标消失则让这一轮失败；
-最后一项把「loop 开 turn → 插件写替换 → 新消息落盘 → 收尾」整条日志交给上游
-`assertReleasedV4Relationships` 冷读。
-`test/intervals.test.ts`（9 项）管客户端推导——闭区间、重叠区间逐条保留、append 与畸形 marker 不算替换、
-只凭日志重建同一结果，以及「只有 replace 没有 user 的 turn」的识别规则。
-`test/command-run.test.ts`（6 项）管「回填还是报错」——`Session.command()` 只回 `{matched}`、丢掉 handler 结果，
-所以客户端必须读 `commands.execute` 的 `result.kind`：**宿主拒绝时一个字都不能回填**。
-其中两项直接驱动真实 `/redo` handler，把它的拒绝原文喂给分类器，期望值取自生产路径而不是测试里重打的常量。
-改 `src/index.ts` 前先跑它。变异检验都能立刻变红，最近一轮：**TTL 永不失效**（红 1 项）/ **去掉 step 作用域**（红 1 项）/
-**`sourceEventSeqs` 少一个节点**（红 2 项，含上游校验器那项）/ **把 handler 的 `kind:'error'` 当成功**（红 2 项，
-含真实 handler 那项）。
+自动化 `npm test` 30 项（宿主 15 / 区间推导 9 / 回填判定 6），跑在 TS 源码上，不需要构建；
+CI 依次跑 `typecheck` → `test` → `build`。变异检验与手工验证记录见
+[docs/design.md](docs/design.md#验证)。
 
-**手工（packaged GUI + `redo-test` profile + 本地 Cherry 网关）**：
-
-| 时间 | 路径 | GUI 表现 | JSONL 证据 |
-| --- | --- | --- | --- |
-| 10-24 20:1x | 编辑重发（文字/图片）、重新生成 | 三种路径均生效 | `replace 8..26` / `57..59` + 新 `user/message` |
-| 10-24 22:5x | 旧版「点击即撤回」 | 时间线即时清空 | `turn/start 2` → `replace 8..18` → `turn/end 2` |
-| 10-29 14:37 | **旧版撞号事故** | 撤回写了 turn 12，loop 随后又写 turn 12；会话冷读失败 | `turn/start 12`(3619) → … → `turn/start 12`(3626) |
-| 10-29 15:25 | **0.4 登记式（本次）** | 点「编辑重发」：消息立刻消失、composer 拿到原文，日志**只有** `command/run`+`command/done` | 事件 21-22，无 turn、无 replace |
-| 10-29 15:26 | 0.4 发送 | 画面上只剩 1 条消息；刷新后仍是 1 条，无「历史加载失败」 | `turn/start 2`(loop) → `step/start` → `replace 8..18` → 新 `user/message`(28) → 回答 |
-
-上下文确实被重写：替换之后的请求只带新消息；冷读通过（旧内容被 `surface replace` 遮蔽，不会进入模型请求）。

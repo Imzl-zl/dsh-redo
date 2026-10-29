@@ -7,6 +7,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This plugin talks to a host that has no compatibility shims, so the DSH version each release was
 built against is recorded alongside it.
 
+## [Unreleased]
+
+## [0.3.2] - 2026-10-29
+
+Built against DSH `0.2.1-rc.3`.
+
+### Fixed
+
+- **A refused `/redo` no longer refills the composer.** The client read
+  `Session.command()`'s `{ matched }` and treated it as success, but that projection drops the
+  handler result: when the Host refuses the click (a Turn still open, a target that already left the
+  context, the session head, a non-user node) nothing is written and the composer was still filled
+  with the message's text and images — the exact "it did not retract, but went back to the input
+  box" report. The click now reads `commands.execute`'s acknowledgment and requires
+  `result.kind === 'success'` (`src/client/command-run.ts`); a refusal surfaces the Host's own text
+  instead. Locked by `test/command-run.test.ts`, which drives the real `/redo` handler and feeds its
+  refusal to the classifier.
+- The row's three actions are real `disabled` buttons instead of `aria-disabled` ones that only
+  looked unavailable: a click on a greyed 编辑重发 was swallowed by an internal guard, so it read as
+  "nothing happened".
+
 ## [0.3.1] - 2026-10-26
 
 Built against DSH `0.2.1-rc.3`.
@@ -129,7 +150,8 @@ Initial release.
   empty `system/message` as the replacement so it never projects to a model message.
 - Inline confirmation before a mid-conversation rewrite, with the number of turns it drops.
 
-[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.2.0...v0.2.1

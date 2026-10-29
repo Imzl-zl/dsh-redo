@@ -4,9 +4,9 @@
  * Replaces the keyed `user` Chat node cell so one human message gains two
  * actions: retry it as-is, or move it back into the composer and let the next
  * send rewrite it. Retry sends through the ordinary prompt Remote with a
- * `redo:` request id; edit only *arms* the Host through the `/redo <seq>`
- * command and refills the composer, so the send itself is an ordinary composer
- * submission — the same one the user would type by hand.
+ * `redo:` request id; edit rewinds the Host **at the click** through the
+ * `/redo <seq>` command and refills the composer, so the send itself is an
+ * ordinary composer submission — the same one the user would type by hand.
  *
  * Replacing an occupied keyed cell is a supported extension point, but it
  * means this package owns the user row's layout. The bubble itself is still
@@ -55,13 +55,14 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: pulls `ctx.conversation`, `ctx.uiConversation`, and the `chat` target merge.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import { classifyCommandRun, type CommandRun } from './command-run.ts'
 import {
   covers, deriveIntervals, deriveRetractionTurns,
   type SupersededInterval, type SurfaceEventLike,
 } from './intervals.ts'
 import { en, zh, type RedoKey } from './locales.ts'
 
-export const inject = ['slots', 'sessions', 'conversation', 'uiConversation', 'locale']
+export const inject = ['slots', 'sessions', 'conversation', 'uiConversation', 'locale', 'remote', 'remote.commands']
 
 /** Dictionary namespace owned by this plugin. */
 const NS = 'redo'
@@ -590,6 +591,7 @@ function RedoUserMessage({
           className="dsh-redo-action"
           aria-label={copyTitle}
           title={copyTitle}
+          disabled={parts.text === ''}
           aria-disabled={parts.text === '' ? true : undefined}
           data-unavailable={parts.text === '' ? true : undefined}
           onClick={(event) => {
@@ -604,6 +606,7 @@ function RedoUserMessage({
           className="dsh-redo-action"
           aria-label={t('action.retry')}
           title={retryTitle}
+          disabled={!canRetry}
           aria-disabled={canRetry ? undefined : true}
           data-unavailable={canRetry ? undefined : true}
           data-busy={busy ? true : undefined}
@@ -627,6 +630,7 @@ function RedoUserMessage({
           className="dsh-redo-action"
           aria-label={t('action.edit')}
           title={editTitle}
+          disabled={!canEdit}
           aria-disabled={canEdit ? undefined : true}
           data-unavailable={canEdit ? undefined : true}
           data-busy={busy ? true : undefined}
@@ -787,6 +791,33 @@ interface ConversationDraftsFace {
  */
 function conversationDrafts(ctx: Context): ConversationDraftsFace {
   return ctx.conversation as unknown as ConversationDraftsFace
+}
+
+/**
+ * The Remote slice that answers with the handler's outcome.
+ *
+ * `Session.command()` resolves to `{ matched }` and drops the handler result, so
+ * a refused `/redo` (an open Turn, a target that already left the context) is
+ * indistinguishable from a written retraction there. The composer's own path
+ * (`ui-commands`) calls this Remote directly for exactly that reason.
+ */
+interface RemoteCommandsFace {
+  readonly commands: {
+    execute(
+      sessionId: SessionId,
+      line: string,
+      attachments: readonly never[],
+    ): Promise<CommandRun>
+  }
+}
+
+/**
+ * Read that face off the root context.
+ * @param ctx - client root context.
+ * @returns the command Remote.
+ */
+function remoteCommands(ctx: Context): RemoteCommandsFace {
+  return ctx.remote as unknown as RemoteCommandsFace
 }
 
 
@@ -988,10 +1019,16 @@ export function apply(ctx: Context): void {
           ? []
           : conversationDrafts(ctx).createDrafts(sessionId as SessionId, files, true)
         // The retraction is the click: the Host rewinds the context right here,
-        // inside a Turn it opens and closes for exactly this append.
-        const retracted = await session.command(`/redo ${String(target)}`)
-        if (!retracted.ok) return { ok: false, code: 'rejected', message: retracted.error.message }
-        if (!retracted.value.matched) return { ok: false, code: 'command' }
+        // inside a Turn it opens and closes for exactly this append. The full
+        // acknowledgment is read, not just "the command matched": a refused
+        // click rewrites nothing, and refilling the composer anyway is the one
+        // outcome this action must not produce.
+        const verdict = classifyCommandRun(await remoteCommands(ctx).commands.execute(
+          sessionId as SessionId,
+          `/redo ${String(target)}`,
+          [],
+        ))
+        if (!verdict.ok) return verdict
         return { ok: true, draftIds: drafts.map(draft => draft.id) }
       },
       resend: async (target, parts) => {

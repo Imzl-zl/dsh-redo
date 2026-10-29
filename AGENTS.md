@@ -15,6 +15,10 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
   （`NODE_AUTH_TOKEN` 会被 `~/.npmrc` 的 web token 盖掉），发完**立刻在网页删掉**。
 - **测试渠道**：`redo-test` profile 固定走本地 Cherry 免费网关（`http://127.0.0.1:23333/v1`，
   模型 `8497f00c-73d9-4f57-8634-78cb69e0f81a:auto`，key 用凭据里的 `CHERRY_API_KEY`）；测试不要走官方渠道。
+- **`redo-test\node_modules\dsh-redo` 必须是指向本仓库的链接**（junction / `link:`），不能是克隆或拷贝：
+  宿主只从 profile 的 `node_modules` 解析插件，一份克隆会停在"装的那天"，改完代码也不生效——2026-10-29
+  就因为那里是一份 10/26 的克隆，把"改完了"误当成"隔离实例里生效了"。宿主加载的是 `lib/`，所以链接后仍要
+  `npm run build`。`desktop` 那份是 npm tarball 拷贝，属于发布形态，不要当开发入口。
 - 结论与接入点调研见 [docs/research/2026-10-24-edit-resend-seams.md](docs/research/2026-10-24-edit-resend-seams.md)。
 
 ## 不可违背的约束（读源码得出，别再试错）
@@ -120,7 +124,7 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 
 ## 已验证
 
-**自动化**：`npm test`（28 项）。
+**自动化**：`npm test`（34 项）。
 `test/redo.test.ts`（22 项）管宿主半——撤回命令写出的五个事件顺序与坐标（turn/step 精确、turn 号取自
 `turnBoundary` 的 `lastTurn + 1`、不留 open step）、`sourceEventSeqs` 全覆盖被遮蔽的 surface 尾、节点 0 拒改、
 替换是空 system 而非 user、非法参数/越界目标/非人类消息全被拒且不碰日志；**未关闭 turn 时撤回被拒且一个事件都不写**，
@@ -129,8 +133,12 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 重试路线覆盖 plan 只消费一次、step 作用域、畸形 requestId 不重写。
 `test/intervals.test.ts`（6 项）管客户端推导——闭区间、重叠区间逐条保留、append 与畸形 marker 不算替换、
 只凭日志重建同一结果，以及「只有 replace 没有 user 的 turn」被认成撤回 turn。
+`test/command-run.test.ts`（6 项）管「回填还是报错」——`Session.command()` 只回 `{matched}`、丢掉 handler 结果，
+所以客户端必须读 `commands.execute` 的 `result.kind`：**宿主拒绝（回合没关、目标已不在上下文）时一个字都不能回填**。
+其中两项直接驱动真实 `/redo` handler，把它的拒绝原文喂给分类器，期望值取自生产路径而不是测试里重打的常量。
 改 `src/index.ts` 前先跑它。变异检验都能立刻变红，最近一轮：收窄 `endSeq` / 少一个 `sourceEventSeqs` 节点 /
-去掉 TTL 判断 / **去掉未关闭 turn 的门禁**（红 2 项）/ **turn 号写成 `lastTurn + 2`**（红 3 项，含上游校验器那项）。
+**把 handler 的 `kind:'error'` 当成功**（红 2 项，含真实 handler 那项）/ **去掉未关闭 turn 的门禁**（红 2 项）/
+**turn 号写成 `lastTurn + 2`**（红 3 项，含上游校验器那项）。
 
 **手工（packaged 0.2.1-rc.2 GUI + `redo-test` profile + 本地 Cherry 网关）**：
 

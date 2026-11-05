@@ -1,49 +1,12 @@
 /** Decode one v4 session log and print the event shape this plugin cares about. */
-import { readFileSync } from 'node:fs'
-import { zstdDecompressSync } from 'node:zlib'
+import { readSession } from './read-session.mjs'
 
 const file = process.argv[2]
 if (file === undefined) throw new Error('usage: node dump-session.mjs <session.v4.jsonl.zstd> [--json]')
 
-const raw = readFileSync(file)
-
-/** Offsets of the zstd frame magic; one append batch is one frame. */
-function frameOffsets(buffer) {
-  const offsets = []
-  for (let index = 0; index + 3 < buffer.length; index += 1) {
-    if (buffer[index] === 0x28 && buffer[index + 1] === 0xB5 && buffer[index + 2] === 0x2F && buffer[index + 3] === 0xFD) {
-      offsets.push(index)
-    }
-  }
-  return offsets
-}
-
-const offsets = [...frameOffsets(raw), raw.length]
-const chunks = []
-// Walk frames; a magic sequence can occur inside compressed bytes, so extend the
-// candidate end until the slice decodes.
-for (let start = 0; start < raw.length;) {
-  let decoded
-  let end = start
-  for (const candidate of offsets) {
-    if (candidate <= start) continue
-    try {
-      decoded = zstdDecompressSync(raw.subarray(start, candidate))
-      end = candidate
-      break
-    } catch {
-      continue
-    }
-  }
-  if (decoded === undefined) throw new Error(`undecodable zstd frame at offset ${start}`)
-  chunks.push(decoded)
-  start = end
-}
-const text = Buffer.concat(chunks).toString('utf8')
-
-const rows = text.split('\n').filter(line => line.trim() !== '').map(line => JSON.parse(line))
-const header = rows[0]
-const events = rows.slice(1)
+// The frame walk and the range decoding live in read-session.mjs: a second copy
+// here is what printed `src=[8,12,17]` for the run 8..12 plus 17.
+const { header, events } = readSession(file)
 
 if (process.argv.includes('--json')) {
   console.log(JSON.stringify(events, null, 2))

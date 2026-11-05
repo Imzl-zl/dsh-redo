@@ -9,6 +9,34 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+Built against DSH `0.2.2-rc.1` (cordis `4.1.0`).
+
+### Changed
+
+- **`engines.dsh` 下界从 `>=0.2.0-rc.1` 收到 `>=0.2.1-rc.2`。** `0.2.0-rc.1` 上 `renderFactorySlot` 和
+  `UserContentData` 还不存在，类型检查直接失败——那一行也渲染不出来。原来那个范围是虚标的，而 DSH 会按它放行
+  实际跑不起来的组合。
+- **Dev dependencies moved to DSH `0.2.2-rc.1` and cordis `4.1.0`.** `0.2.2` ships vendored cordis `4.1.0` and
+  `@deepseek-ai/dsh-agent@0.2.2-rc.1` peers `~4.1.0`, so the old `4.0.5` pin no longer installs at all. Every seam
+  the plugin uses still exists: `typecheck` and all 34 tests pass unchanged against the new packages.
+
+### Added
+
+- **Compatibility matrix** (`compatibility` job in `.github/workflows/ci.yml`, driven by
+  `scripts/pin-dsh-deps.mjs`): one row per end of `engines.dsh`, each installed at the exact DSH release and
+  vendored cordis a user on that version resolves (`0.2.1-rc.2` + cordis `4.0.5`, `0.2.2-rc.1` + cordis `4.1.0`),
+  then `typecheck` + `test`. The dev dependencies are only the type-check target; these two rows are what makes the
+  declared range mean something.
+
+### Fixed
+
+- **`scripts/check-sessions.mjs` refused healthy sessions.** Since DSH `0.2.1-rc.5` a stored `sourceEventSeqs` is
+  range-encoded — `[[8,12],17]` means the run 8..12 plus 17 — and the format codec expands it on every real read
+  (`session-format-v0-to-v1/src/codec.ts`). The reader parsed the JSONL directly, so a complete citation list looked
+  truncated and every session this plugin had rewritten was refused with `replacement sourceEventSeqs omit a shadowed
+  surface node`. `readSession` now decodes ranges the way the codec does, `dump-session.mjs` prints logical seqs
+  instead of the stored form, and its duplicate zstd frame walk is gone.
+
 ## [0.4.0] - 2026-10-29
 
 Built against DSH `0.2.1-rc.3`.

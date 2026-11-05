@@ -19,6 +19,14 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
   宿主只从 profile 的 `node_modules` 解析插件，一份克隆会停在"装的那天"，改完代码也不生效——2026-10-29
   就因为那里是一份 10/26 的克隆，把"改完了"误当成"隔离实例里生效了"。宿主加载的是 `lib/`，所以链接后仍要
   `npm run build`。`desktop` 那份是 npm tarball 拷贝，属于发布形态，不要当开发入口。
+- **兼容性契约是 `engines.dsh`**，不是 devDeps：DSH 在安装和 profile 启动时按这个范围决定装不装、加不加载
+  （`packages/boot/app-boot/src/plugin-compatibility.ts`；声明了 `engines.dsh` 时 peer 依赖被忽略）。devDeps
+  只是**类型检查目标**。范围两端由 CI 的 `compatibility` 矩阵各装一次依赖验证，改范围必须同时改矩阵。
+  DSH ↔ vendored cordis 绑定：`0.2.0-rc.1`→`4.0.4`、`0.2.1-rc.5`→`4.0.5`、`0.2.2-rc.1`→`4.1.0`。
+  `0.2.0-rc.1` 上 `renderFactorySlot` 和 `UserContentData` 还不存在（类型直接过不了），所以下界是
+  `0.2.1-rc.2`，别再往下放。
+- **插件对宿主零运行时依赖**：`src` 里对 `@deepseek-ai/*` 全是 `import type`，构建产物 `lib/*.js` 里出现
+  0 次。这是"同一份 build 同时跑 0.2.1 和 0.2.2"的依据；引入任何值导入都会破坏它，得同时收窄 `engines.dsh`。
 - 结论与接入点调研见 [docs/research/2026-10-24-edit-resend-seams.md](docs/research/2026-10-24-edit-resend-seams.md)；
   面向人的设计与验证说明在 [docs/design.md](docs/design.md)，README 只放安装与用法。
 
@@ -107,6 +115,7 @@ npm run typecheck
 node scripts/dump-session.mjs <session.v4.jsonl.zstd>            # 解码会话日志
 node scripts/check-sessions.mjs <会话目录或文件>                  # 用上游 V4 校验器逐份冷读，报第一处坏事件
 node scripts/repair-session.mjs <session.v4.jsonl.zstd>           # 修 turn 号撞车：从第一处错位起整体后移，备份+校验后才写盘
+node scripts/pin-dsh-deps.mjs <dsh> <cordis>                      # 把 devDeps 钉到某个 DSH 版本（复验 engines.dsh 范围用，用完 git checkout 还原）
 ```
 
 上游源码仍**未安装依赖**；需要跑上游测试时才 `pnpm install`。
@@ -128,7 +137,8 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 
 ## 已验证
 
-自动化 `npm test` 30 项（宿主 15 / 区间推导 9 / 回填判定 6），跑在 TS 源码上，不需要构建；
-CI 依次跑 `typecheck` → `test` → `build`。变异检验与手工验证记录见
+自动化 `npm test` 34 项（宿主 15 / 区间推导 9 / 回填判定 6 / 会话日志解码 4），跑在 TS 源码上，不需要构建；
+CI 的 `build` 跑 `typecheck` → `test` → `build`，`compatibility` 矩阵对 `engines.dsh` 两端（`0.2.1-rc.2` +
+cordis `4.0.5`、`0.2.2-rc.1` + cordis `4.1.0`）各跑一次 `typecheck` → `test`。变异检验与手工验证记录见
 [docs/design.md](docs/design.md#验证)。
 

@@ -9,6 +9,8 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-05
+
 Built against DSH `0.2.2-rc.1` (cordis `4.1.0`).
 
 ### Changed
@@ -36,6 +38,15 @@ Built against DSH `0.2.2-rc.1` (cordis `4.1.0`).
   truncated and every session this plugin had rewritten was refused with `replacement sourceEventSeqs omit a shadowed
   surface node`. `readSession` now decodes ranges the way the codec does, `dump-session.mjs` prints logical seqs
   instead of the stored form, and its duplicate zstd frame walk is gone.
+
+### Verified
+
+- **Both ends of the range were driven, not just type-checked.** The same `lib/` build ran in an isolated
+  `DSH_HOME` against the packaged `0.2.1-rc.5` and against `@deepseek-ai/dsh@0.2.2-rc.1` (vendored cordis `4.1.0`)
+  installed from npm. In each, edit-and-resend wrote
+  `system/message replace <target>..<tail> src=[…] content=0` inside the step the loop had already opened, the
+  edited message landed after it, the retry path carried `redo:<seq>:<uuid>` in the request id, turn numbers stayed
+  consecutive, and `check-sessions.mjs` cold-read every log with zero refusals.
 
 ## [0.4.0] - 2026-10-29
 
@@ -199,7 +210,8 @@ Initial release.
   empty `system/message` as the replacement so it never projects to a model message.
 - Inline confirmation before a mid-conversation rewrite, with the number of turns it drops.
 
-[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.0...v0.3.1

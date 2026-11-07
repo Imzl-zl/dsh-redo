@@ -9,6 +9,10 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-07
+
+Built against DSH `0.2.2-rc.1` (cordis `4.1.0`).
+
 ### Fixed
 
 - **Harness surface replacements no longer blank the transcript.** The rewind intervals were derived from every `surfaceOp: replace` in the log, but compaction (`user/message` + `compact-checkpoint`), system-prompt refreshes, result pruning, and context injection all write one too — and their ranges contain real user prompts. Each affected Turn was then hidden, so a long session that compacted rendered zero rows and the chat frame collapsed to the paging button. A replacement now counts only when it is the one this plugin writes: an empty `system/message`. Reported in [#1](https://github.com/Imzl-zl/dsh-redo/issues/1).
@@ -226,7 +230,8 @@ Initial release.
   empty `system/message` as the replacement so it never projects to a model message.
 - Inline confirmation before a mid-conversation rewrite, with the number of turns it drops.
 
-[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.2...v0.4.0

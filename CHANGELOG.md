@@ -9,6 +9,10 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-07
+
+Built against DSH `0.2.2-rc.1` (cordis `4.1.0`).
+
 ### Changed
 
 - **Raised the minimum DSH version to `0.2.2-rc.1`.** This is the first verified release used here with the complete `ImageAttachmentRef` attachment-read API; earlier `0.2.1` releases accept only an attachment ID.
@@ -218,7 +222,8 @@ Initial release.
   empty `system/message` as the replacement so it never projects to a model message.
 - Inline confirmation before a mid-conversation rewrite, with the number of turns it drops.
 
-[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Imzl-zl/dsh-redo/compare/v0.3.1...v0.3.2

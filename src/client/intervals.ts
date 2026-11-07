@@ -53,6 +53,35 @@ function replaceRangeOf(op: unknown): SupersededInterval | undefined {
 }
 
 /**
+ * Whether one event is the replacement this plugin writes.
+ *
+ * A rewind appends an empty `system/message`: the only node that is both
+ * invisible in the Chat flow and projects no model message. Every other surface
+ * replacement in the log belongs to the harness — compaction swaps an earlier
+ * span for a checkpoint, a system-prompt refresh swaps the head, pruning and
+ * context injection swap single nodes — and all of those carry content. Reading
+ * their markers as rewinds hid ordinary Turns and blanked the transcript.
+ *
+ * @param event - one event.
+ * @returns whether the event is this plugin's replacement.
+ */
+function isRedoRewrite(event: SurfaceEventLike): boolean {
+  if (event.type !== 'system/message') return false
+  const content = (event.data as { message?: { content?: unknown } } | undefined)?.message?.content
+  return Array.isArray(content) && content.length === 0
+}
+
+/**
+ * The interval one event removed, when the event is a rewind of this plugin's.
+ * @param event - one event.
+ * @returns the replaced range, or undefined for an append, a harness
+ *   replacement, or a malformed marker.
+ */
+function rewoundRangeOf(event: SurfaceEventLike): SupersededInterval | undefined {
+  return isRedoRewrite(event) ? replaceRangeOf(event.surfaceOp) : undefined
+}
+
+/**
  * Whether a seq was removed from the conversation by a rewind.
  * @param intervals - the Session's derived intervals.
  * @param seq - message seq to test.
@@ -75,7 +104,7 @@ export function covers(intervals: readonly SupersededInterval[], seq: number): b
 export function deriveIntervals(events: readonly SurfaceEventLike[]): readonly SupersededInterval[] {
   const intervals: SupersededInterval[] = []
   for (const event of events) {
-    const range = replaceRangeOf(event.surfaceOp)
+    const range = rewoundRangeOf(event)
     if (range !== undefined) intervals.push(range)
   }
   return intervals
@@ -119,7 +148,7 @@ export function deriveRetractionTurns(events: readonly SurfaceEventLike[]): read
     }
     if (turn === undefined) continue
     if (event.type === 'user/message') prompted.add(turn)
-    else if (replaceRangeOf(event.surfaceOp) !== undefined) replaced.add(turn)
+    else if (rewoundRangeOf(event) !== undefined) replaced.add(turn)
   }
   return [...replaced].filter(value => !prompted.has(value))
 }

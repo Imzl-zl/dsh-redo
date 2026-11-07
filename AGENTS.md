@@ -137,7 +137,7 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 
 ## 已验证
 
-自动化 `npm test` 39 项（宿主 15 / 区间推导 9 / 回填判定 6 / 会话日志解码 4 / 图片编辑与重发 5），跑在 TS 源码上，不需要构建；
+自动化 `npm test` 42 项（宿主 15 / 区间推导 12 / 回填判定 6 / 会话日志解码 4 / 图片编辑与重发 5），跑在 TS 源码上，不需要构建；
 CI 的 `build` 跑 `typecheck` → `test` → `build`，`compatibility` 矩阵对 `engines.dsh` 下界（`0.2.2-rc.1` +
 cordis `4.1.0`）跑 `typecheck` → `test`；出现新的 DSH 上界时再加一行。变异检验与手工验证记录见
 [docs/design.md](docs/design.md#验证)。

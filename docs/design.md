@@ -44,15 +44,20 @@ requestId 里的目标按纯数字解析（`/^(\d+):/`）；`Number()` 会把 `r
   会把所在 Turn 的容器行（`data-chat-turn`）一并隐藏，`MutationObserver` 补上晚到的行。
 - 区间不靠客户端记账：从会话自己的事件窗口（`binding.eventSource`）读 `surface replace` 反推
   （`src/client/intervals.ts`，纯函数，`test/intervals.test.ts` 锁它）。
+- **只认自己写的替换**：日志里的 `replace` 不都是撤回。压缩写 `user/message` + `compact-checkpoint`、
+  系统提示刷新写带正文的 `system/message`、裁剪/上下文注入各替换单个节点——它们的区间里都有真实用户消息。
+  判定依据是插件自己的签名：`system/message` 且 `content` 为空。把 harness 的替换当成撤回，会把整段对话
+  隐藏成白板（issue #1）。
 
 ## 验证
 
-**自动化**：`npm test`（39 项，直接跑 TS 源码）。
+**自动化**：`npm test`（42 项，直接跑 TS 源码）。
 
 - `test/redo.test.ts`（15 项）：命令只登记、不写事件；替换落在 loop 的 turn/step；`sourceEventSeqs` 全覆盖；
   登记只驱动一次发送、过期不生效、`off`/销毁清空、注入 context 不消费；重试压过登记、畸形 id 不重写、
   plan 按 step 作用域只消费一次；各类拒绝不碰日志；整条日志交上游 `assertReleasedV4Relationships` 冷读。
-- `test/intervals.test.ts`（9 项）：区间推导与「只有 replace 没有 user 的 turn」识别。
+- `test/intervals.test.ts`（12 项）：区间推导、「只有 replace 没有 user 的 turn」识别，以及压缩/系统提示
+  这类 harness 替换不得被当成撤回。
 - `test/command-run.test.ts`（6 项）：命令结果 → 是否回填的映射，其中两项驱动真实 `/redo` handler。
 - `test/client-attachments.test.mjs`（5 项）：驱动真实浏览器入口，验证完整图片引用用于编辑和重发、读取失败不发送缺图消息。
 

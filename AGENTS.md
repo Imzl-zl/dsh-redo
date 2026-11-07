@@ -23,10 +23,10 @@ DSH 插件：编辑/重试已发送的用户消息并重新生成。
   （`packages/boot/app-boot/src/plugin-compatibility.ts`；声明了 `engines.dsh` 时 peer 依赖被忽略）。devDeps
   只是**类型检查目标**。范围两端由 CI 的 `compatibility` 矩阵各装一次依赖验证，改范围必须同时改矩阵。
   DSH ↔ vendored cordis 绑定：`0.2.0-rc.1`→`4.0.4`、`0.2.1-rc.5`→`4.0.5`、`0.2.2-rc.1`→`4.1.0`。
-  `0.2.0-rc.1` 上 `renderFactorySlot` 和 `UserContentData` 还不存在（类型直接过不了），所以下界是
-  `0.2.1-rc.2`，别再往下放。
+  `0.2.0-rc.1` 上 `renderFactorySlot` 和 `UserContentData` 还不存在（类型直接过不了），扩展点下界是
+  `0.2.1-rc.2`；当前插件还依赖 `Session.readAttachment(ImageAttachmentRef)`，所以已验证范围从 `0.2.2-rc.1` 开始。
 - **插件对宿主零运行时依赖**：`src` 里对 `@deepseek-ai/*` 全是 `import type`，构建产物 `lib/*.js` 里出现
-  0 次。这是"同一份 build 同时跑 0.2.1 和 0.2.2"的依据；引入任何值导入都会破坏它，得同时收窄 `engines.dsh`。
+  0 次。这保证不需要把宿主包打进插件，但不代表宿主 API 跨版本兼容；修改公共 API 参数或行为时，必须重新验证并收窄 `engines.dsh`。
 - 结论与接入点调研见 [docs/research/2026-10-24-edit-resend-seams.md](docs/research/2026-10-24-edit-resend-seams.md)；
   面向人的设计与验证说明在 [docs/design.md](docs/design.md)，README 只放安装与用法。
 
@@ -137,8 +137,8 @@ workflow `release.yml`）。重命名/移动它必须在 npmjs.com 的包设置�
 
 ## 已验证
 
-自动化 `npm test` 34 项（宿主 15 / 区间推导 9 / 回填判定 6 / 会话日志解码 4），跑在 TS 源码上，不需要构建；
-CI 的 `build` 跑 `typecheck` → `test` → `build`，`compatibility` 矩阵对 `engines.dsh` 两端（`0.2.1-rc.2` +
-cordis `4.0.5`、`0.2.2-rc.1` + cordis `4.1.0`）各跑一次 `typecheck` → `test`。变异检验与手工验证记录见
+自动化 `npm test` 39 项（宿主 15 / 区间推导 9 / 回填判定 6 / 会话日志解码 4 / 图片编辑与重发 5），跑在 TS 源码上，不需要构建；
+CI 的 `build` 跑 `typecheck` → `test` → `build`，`compatibility` 矩阵对 `engines.dsh` 下界（`0.2.2-rc.1` +
+cordis `4.1.0`）跑 `typecheck` → `test`；出现新的 DSH 上界时再加一行。变异检验与手工验证记录见
 [docs/design.md](docs/design.md#验证)。
 

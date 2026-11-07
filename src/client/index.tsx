@@ -1060,7 +1060,7 @@ export function apply(ctx: Context): void {
         // a message whose images can no longer be recovered.
         const files: File[] = []
         for (const [index, image] of images.entries()) {
-          const stored = await session.readAttachment(image.attachmentId)
+          const stored = await session.readAttachment(image)
           if (!stored.ok) return { ok: false, code: 'attachment' }
           files.push(new File(
             [stored.value.data],
@@ -1102,7 +1102,7 @@ export function apply(ctx: Context): void {
         // upload).
         const wire = await Promise.all(parts.map(async (part) => {
           if (part.type === 'text') return { type: 'text', text: part.text }
-          const stored = await session.readAttachment(part.attachment.attachmentId)
+          const stored = await session.readAttachment(part.attachment)
           if (!stored.ok) return undefined
           return {
             type: 'image',

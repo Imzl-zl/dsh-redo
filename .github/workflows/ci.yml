@@ -21,23 +21,17 @@ jobs:
       - run: npm test
       - run: npm run build
 
-  # `engines.dsh` is a promise DSH enforces at install and at profile startup:
-  # outside the range the bundle is refused. This job is what keeps that promise
-  # honest — one row per end of the declared range, installed at the exact DSH
-  # release (and its vendored cordis) a user on that version resolves.
-  #
-  # The dev dependencies in package.json are only the type-check target, never
-  # the contract, which is why each row repins them instead of trusting them.
+  # `engines.dsh` is enforced at install and profile startup. This matrix checks
+  # the minimum supported release with its vendored cordis; build checks the
+  # development target. Dev dependencies are the type-check target, not the
+  # compatibility contract, so pin both explicitly here.
   compatibility:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Lower bound of `engines.dsh`.
-          - dsh: '0.2.1-rc.2'
-            cordis: '4.0.5'
-          # Upper bound: the newest release this package is verified against.
+          # Minimum supported release; it also carries the complete-reference image-read API.
           - dsh: '0.2.2-rc.1'
             cordis: '4.1.0'
     steps:

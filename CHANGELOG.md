@@ -9,6 +9,14 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+### Changed
+
+- **Raised the minimum DSH version to `0.2.2-rc.1`.** This is the first verified release used here with the complete `ImageAttachmentRef` attachment-read API; earlier `0.2.1` releases accept only an attachment ID.
+
+### Fixed
+
+- **Stored images failed to edit or retry after upgrading DSH.** Both browser actions passed only `attachmentId` to `Session.readAttachment`, but the current Host verifies the complete image reference. They now pass the original `ImageAttachmentRef`; edit stages the recovered bytes as a draft, and retry sends those bytes with the original text and name.
+
 ## [0.4.1] - 2026-11-05
 
 Built against DSH `0.2.2-rc.1` (cordis `4.1.0`).

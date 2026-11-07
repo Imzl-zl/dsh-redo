@@ -36,7 +36,7 @@ requestId 里的目标按纯数字解析（`/^(\d+):/`）；`Number()` 会把 `r
 
 - 接管 keyed `conversation.chat.node` 的 `user` 单元；气泡本体仍用官方 `conversation.chat.user.content` 工厂。
 - 点击编辑：调 `/redo`（读 `commands.execute` 的完整结果，`result.kind === 'error'` 就报错、不回填）→
-  `setDraft(text)` → 图片经 `readAttachment` → `File` → `createDrafts` → `addAttachments`。
+  `setDraft(text)` → 图片用完整 `ImageAttachmentRef` 调 `readAttachment` → `File` → `createDrafts` → `addAttachments`。
 - **本地隐藏**：替换要到发送才落盘，所以点击后先把目标记进 `PENDING`（TTL 5 分钟）并通知行重渲染；
   事件窗口一旦出现覆盖它的 `replace`，本地标记删除、隐藏交给日志（刷新后依然隐藏）。
   过期未发送则标记失效，消息重新出现。
@@ -47,13 +47,14 @@ requestId 里的目标按纯数字解析（`/^(\d+):/`）；`Number()` 会把 `r
 
 ## 验证
 
-**自动化**：`npm test`（30 项，直接跑 TS 源码）。
+**自动化**：`npm test`（39 项，直接跑 TS 源码）。
 
 - `test/redo.test.ts`（15 项）：命令只登记、不写事件；替换落在 loop 的 turn/step；`sourceEventSeqs` 全覆盖；
   登记只驱动一次发送、过期不生效、`off`/销毁清空、注入 context 不消费；重试压过登记、畸形 id 不重写、
   plan 按 step 作用域只消费一次；各类拒绝不碰日志；整条日志交上游 `assertReleasedV4Relationships` 冷读。
 - `test/intervals.test.ts`（9 项）：区间推导与「只有 replace 没有 user 的 turn」识别。
 - `test/command-run.test.ts`（6 项）：命令结果 → 是否回填的映射，其中两项驱动真实 `/redo` handler。
+- `test/client-attachments.test.mjs`（5 项）：驱动真实浏览器入口，验证完整图片引用用于编辑和重发、读取失败不发送缺图消息。
 
 变异检验（每一种都会让测试变红）：TTL 永不失效、去掉 step 作用域、`sourceEventSeqs` 少一个节点、
 把 handler 的 `error` 当成功。

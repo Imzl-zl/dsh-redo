@@ -35,7 +35,7 @@ DSH 的会话是只追加的日志，消息发出去就没有"改一下再发"�
 
 ## 安装
 
-需要 DSH `>= 0.2.0-rc.1 < 0.3.0`，在 Web GUI 里使用。发布物已含构建好的 `lib/`，不需要自己 build。
+需要 DSH `>= 0.2.2-rc.1 < 0.3.0`，在 Web GUI 里使用。发布物已含构建好的 `lib/`，不需要自己 build。
 
 ```sh
 dsh plugin --profile <profile> add dsh-redo
@@ -72,7 +72,7 @@ dsh plugin --profile <profile> add <本仓库绝对路径>
 
 | 项目 | 说明 |
 | --- | --- |
-| DSH | `>= 0.2.0-rc.1 < 0.3.0`，实测 `0.2.1-rc.2` / `0.2.1-rc.3` |
+| DSH | `>= 0.2.2-rc.1 < 0.3.0`，基于 `0.2.2-rc.1`（cordis `4.1.0`）验证 |
 | 平台 | Web GUI |
 | 扩展点 | keyed slot `conversation.chat.node`、`agent/pre-step`、`agent/request`、`ctx.commands` |
 

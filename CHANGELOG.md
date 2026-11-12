@@ -9,6 +9,29 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dev dependencies moved to DSH `0.2.2-rc.2` (cordis `4.1.0`); no behavior change.**
+  `0.2.2-rc.2` keeps the vendored cordis, so only the type-check target moved. Re-verified against it:
+  `npm run typecheck`, the 42 host/interval/attachment tests, and the release validator that reads
+  back the log this plugin writes. Every seam held unchanged — `agent/pre-step`, `agent/request`,
+  the keyed `conversation.chat.node` cell, `data-chat-turn` / `data-chat-flow-kind` / `data-chat-node-key`,
+  the shipped user row (`MessageItem.tsx` is untouched), `conversation.createDrafts`,
+  `Session.readAttachment(ImageAttachmentRef)`, and the `surface replace` rules including
+  `assertSystemHeadRewrite`. `engines.dsh` stays `>=0.2.2-rc.1 <0.3.0`: the CI matrix still verifies
+  the lower bound, and the build job now verifies this one.
+
+### Investigated
+
+- **`0.2.2-rc.2` still has no native edit-sent-message interface**, so the plugin keeps its own write
+  path (arm + `agent/request`). Two new host features were checked and do not replace it:
+  `Session.appendBatch` (atomic multi-event append with surface intents — this plugin writes a single
+  event), and empty-content prompts as generation continuation after a failure (`retry-rpc`,
+  `InputActions` `allowEmpty`) — a different operation from rewinding and resending.
+- Prompt de-duplication by request id is now recovered from the log (`user/message` and
+  `agent/inbox/spliced`), not just from the live Agent, so the retry path's rule to mint a fresh uuid
+  per click now also holds across a Host restart. No code change: the id was already fresh per click.
+
 ## [0.4.3] - 2026-11-07
 
 Built against DSH `0.2.2-rc.1` (cordis `4.1.0`).

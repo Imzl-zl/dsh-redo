@@ -72,7 +72,7 @@ dsh plugin --profile <profile> add <本仓库绝对路径>
 
 | 项目 | 说明 |
 | --- | --- |
-| DSH | `>= 0.2.2-rc.1 < 0.3.0`，基于 `0.2.2-rc.1`（cordis `4.1.0`）验证 |
+| DSH | `>= 0.2.2-rc.1 < 0.3.0`，基于 `0.2.2-rc.2`（cordis `4.1.0`）验证 |
 | 平台 | Web GUI |
 | 扩展点 | keyed slot `conversation.chat.node`、`agent/pre-step`、`agent/request`、`ctx.commands` |
 

@@ -7,7 +7,7 @@
  * same source can be checked against each end of the declared range.
  *
  * DSH ships its own vendored cordis, and the pairing is fixed, so both move
- * together: 0.2.0-rc.1 → 4.0.4, 0.2.1-rc.5 → 4.0.5, 0.2.2-rc.1 → 4.1.0.
+ * together: 0.2.0-rc.1 → 4.0.4, 0.2.1-rc.5 → 4.0.5, 0.2.2-rc.1/rc.2 → 4.1.0.
  *
  * It mutates `package.json` on purpose — that is the point of a pin. Locally,
  * restore afterwards with `git checkout package.json package-lock.json`.

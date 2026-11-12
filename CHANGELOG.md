@@ -9,6 +9,10 @@ built against is recorded alongside it.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-12
+
+Built against DSH `0.2.2-rc.2` (cordis `4.1.0`).
+
 ### Changed
 
 - **Dev dependencies moved to DSH `0.2.2-rc.2` (cordis `4.1.0`); no behavior change.**
@@ -253,7 +257,8 @@ Initial release.
   empty `system/message` as the replacement so it never projects to a model message.
 - Inline confirmation before a mid-conversation rewrite, with the number of turns it drops.
 
-[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Imzl-zl/dsh-redo/compare/v0.4.0...v0.4.1
